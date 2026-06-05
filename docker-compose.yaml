@@ -1,0 +1,41 @@
+services:
+  reclip:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: reclip
+    ports:
+      - "8899:8899"
+    env_file:
+      - .env
+    environment:
+      HOST: ${HOST:-0.0.0.0}
+      PORT: ${PORT:-8899}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+      RECLIP_BASE_URL: ${RECLIP_BASE_URL:-}
+      ACL_PATH: ${ACL_PATH:-/app/data/acl.json}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD}
+      SECRET_KEY: ${SECRET_KEY}
+    labels:
+      - "traefik.enable=${TRAEFIK_ENABLE:-false}"
+      - "traefik.docker.network=${TRAEFIK_NETWORK:-proxy}"
+      - "traefik.http.routers.reclip.rule=Host(`${APP_DOMAIN}`)"
+      - "traefik.http.routers.reclip.entrypoints=${TRAEFIK_ENTRYPOINTS:-websecure}"
+      - "traefik.http.routers.reclip.tls=${TRAEFIK_TLS:-true}"
+      - "traefik.http.routers.reclip.tls.certresolver=${TRAEFIK_CERTRESOLVER:-letsencrypt}"
+      - "traefik.http.services.reclip.loadbalancer.server.port=8899"
+    volumes:
+      - downloads:/app/downloads
+      - data:/app/data
+    networks:
+      - traefik
+    restart: unless-stopped
+
+volumes:
+  downloads:
+  data:
+
+networks:
+  traefik:
+    name: ${TRAEFIK_NETWORK:-proxy}
+    external: true

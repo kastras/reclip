@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ReClip — Admin</title>
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg: #f4f1eb;
+      --fg: #3a3a38;
+      --accent: #e85d2a;
+      --accent-hover: #d04e1f;
+      --muted: #9c9889;
+      --card: #fff;
+      --card-border: #e2ded6;
+      --success: #2d8a4e;
+      --error: #c43d3d;
+      --radius: 14px;
+    }
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: 'DM Mono', monospace;
+      background: var(--bg);
+      color: var(--fg);
+      min-height: 100vh;
+    }
+    .page {
+      max-width: 700px;
+      margin: 0 auto;
+      padding: 60px 24px 80px;
+    }
+    .brand { margin-bottom: 40px; }
+    .brand h1 {
+      font-family: 'Instrument Serif', serif;
+      font-size: 3rem;
+      font-weight: 400;
+      letter-spacing: -0.03em;
+      line-height: 1;
+    }
+    .brand h1 em { font-style: italic; color: var(--accent); }
+    .brand p { margin-top: 8px; font-size: 0.72rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
+    a.back { font-size: 0.72rem; color: var(--muted); text-decoration: none; text-transform: uppercase; letter-spacing: 0.05em; }
+    a.back:hover { color: var(--accent); }
+
+    /* Login form */
+    .login-box {
+      background: var(--card);
+      border: 1.5px solid var(--card-border);
+      border-radius: var(--radius);
+      padding: 32px;
+      max-width: 360px;
+    }
+    .login-box h2 { font-size: 1rem; margin-bottom: 20px; }
+    input[type="password"], input[type="text"] {
+      width: 100%;
+      padding: 12px 14px;
+      border: 1.5px solid var(--card-border);
+      border-radius: 8px;
+      background: var(--bg);
+      font-family: 'DM Mono', monospace;
+      font-size: 0.85rem;
+      color: var(--fg);
+      outline: none;
+      margin-bottom: 12px;
+    }
+    input:focus { border-color: var(--accent); }
+    .btn {
+      padding: 11px 20px;
+      border: none;
+      border-radius: 8px;
+      font-family: 'DM Mono', monospace;
+      font-size: 0.82rem;
+      cursor: pointer;
+      letter-spacing: 0.03em;
+    }
+    .btn-primary { background: var(--accent); color: #fff; }
+    .btn-primary:hover { background: var(--accent-hover); }
+    .btn-sm { padding: 6px 14px; font-size: 0.75rem; }
+    .btn-danger { background: var(--error); color: #fff; }
+    .btn-danger:hover { background: #a83030; }
+    .btn-ok { background: var(--success); color: #fff; }
+    .btn-ok:hover { background: #246e3e; }
+    .btn-muted { background: var(--card-border); color: var(--fg); }
+    .btn-muted:hover { background: #d0ccc4; }
+
+    .error-msg {
+      color: var(--error);
+      font-size: 0.78rem;
+      margin-bottom: 12px;
+    }
+
+    /* Panel */
+    .section { margin-bottom: 40px; }
+    .section h2 {
+      font-size: 0.78rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--muted);
+      margin-bottom: 16px;
+      border-bottom: 1px solid var(--card-border);
+      padding-bottom: 8px;
+    }
+
+    /* Approve form */
+    .approve-row {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+    }
+    .approve-row input { margin-bottom: 0; flex: 1; }
+
+    /* Users table */
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.78rem;
+    }
+    th {
+      text-align: left;
+      font-weight: 500;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      padding: 6px 10px;
+      border-bottom: 1px solid var(--card-border);
+    }
+    td {
+      padding: 10px 10px;
+      border-bottom: 1px solid var(--card-border);
+      vertical-align: middle;
+    }
+    tr:last-child td { border-bottom: none; }
+    .badge {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 99px;
+      font-size: 0.68rem;
+      letter-spacing: 0.04em;
+    }
+    .badge-ok { background: #d4f0e0; color: var(--success); }
+    .badge-blocked { background: #fde8e8; color: var(--error); }
+
+    .top-bar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 32px;
+    }
+    .pending-notice {
+      font-size: 0.75rem;
+      color: var(--muted);
+      margin-top: 8px;
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <div class="brand">
+      <h1>Re<em>Clip</em> <span style="font-family:'DM Mono',monospace;font-size:1.2rem;font-weight:400;">Admin</span></h1>
+      <p>Control de acceso Telegram</p>
+    </div>
+
+    {% if not authed %}
+      <!-- LOGIN -->
+      <div class="login-box">
+        <h2>Acceso al panel</h2>
+        {% if error %}<p class="error-msg">{{ error }}</p>{% endif %}
+        <form method="POST">
+          <input type="hidden" name="action" value="login">
+          <input type="password" name="password" placeholder="Contraseña" autofocus>
+          <button class="btn btn-primary" type="submit">Entrar</button>
+        </form>
+      </div>
+
+    {% else %}
+      <!-- PANEL -->
+      <div class="top-bar">
+        <a class="back" href="/">&larr; Volver a ReClip</a>
+        <form method="POST" style="display:inline">
+          <input type="hidden" name="action" value="logout">
+          <button class="btn btn-sm btn-muted" type="submit">Cerrar sesión</button>
+        </form>
+      </div>
+
+      {% if error %}<p class="error-msg" style="margin-bottom:16px;">{{ error }}</p>{% endif %}
+
+      <!-- Aprobar código -->
+      <div class="section">
+        <h2>Aprobar código de acceso</h2>
+        <form method="POST">
+          <input type="hidden" name="action" value="approve">
+          <div class="approve-row">
+            <input type="text" name="code" placeholder="Código de 6 caracteres (ej. A3F9C2)" maxlength="6" autocomplete="off" spellcheck="false" style="text-transform:uppercase;">
+            <button class="btn btn-primary btn-sm" type="submit">Aprobar</button>
+          </div>
+        </form>
+        <p class="pending-notice">Los códigos expiran a los 30 minutos de ser generados por el bot.</p>
+      </div>
+
+      <!-- Usuarios -->
+      <div class="section">
+        <h2>Usuarios ({{ users | length }})</h2>
+        {% if users %}
+        <table>
+          <thead>
+            <tr>
+              <th>Usuario</th>
+              <th>Chat ID</th>
+              <th>Estado</th>
+              <th style="text-align:right;">Descargas</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for chat_id, u in users.items() %}
+            <tr>
+              <td>
+                {% if u.first_name %}{{ u.first_name }}{% endif %}
+                {% if u.username %}<span style="color:var(--muted);">@{{ u.username }}</span>{% endif %}
+              </td>
+              <td style="color:var(--muted);">{{ chat_id }}</td>
+              <td>
+                {% if u.blocked %}
+                  <span class="badge badge-blocked">Bloqueado</span>
+                {% else %}
+                  <span class="badge badge-ok">Activo</span>
+                {% endif %}
+              </td>
+              <td style="text-align:right;">{{ u.downloads or 0 }}</td>
+              <td style="text-align:right;">
+                {% if u.blocked %}
+                  <form method="POST" style="display:inline">
+                    <input type="hidden" name="action" value="unblock">
+                    <input type="hidden" name="chat_id" value="{{ chat_id }}">
+                    <button class="btn btn-sm btn-ok" type="submit">Desbloquear</button>
+                  </form>
+                {% else %}
+                  <form method="POST" style="display:inline">
+                    <input type="hidden" name="action" value="block">
+                    <input type="hidden" name="chat_id" value="{{ chat_id }}">
+                    <button class="btn btn-sm btn-danger" type="submit">Bloquear</button>
+                  </form>
+                {% endif %}
+              </td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+        {% else %}
+          <p style="font-size:0.8rem;color:var(--muted);">Aún no hay usuarios aprobados.</p>
+        {% endif %}
+      </div>
+
+    {% endif %}
+  </div>
+</body>
+</html>
