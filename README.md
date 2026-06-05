@@ -44,6 +44,31 @@ docker build -t reclip . && docker run -p 8899:8899 reclip
 4. Select quality/resolution if available
 5. Click **Download** on individual videos, or **Download All**
 
+## Telegram Bot (Optional)
+
+You can control ReClip from Telegram and receive files directly in chat.
+
+1. Create a bot with [@BotFather](https://t.me/BotFather)
+2. Export your token before starting ReClip:
+
+```bash
+export TELEGRAM_BOT_TOKEN="123456:your_token_here"
+./reclip.sh
+```
+
+On Windows PowerShell:
+
+```powershell
+$env:TELEGRAM_BOT_TOKEN="123456:your_token_here"
+python app.py
+```
+
+Then message your bot with a video URL. ReClip will reply with a Telegram menu where you can choose:
+
+- Best video quality
+- MP3 audio
+- Specific available resolutions (for example, 1080p/720p)
+
 ## Supported Sites
 
 Anything [yt-dlp supports](https://github.com/yt-dlp/yt-dlp/blob/master/supportedsites.md), including:
