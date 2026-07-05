@@ -16,6 +16,7 @@ services:
       ACL_PATH: ${ACL_PATH:-/app/data/acl.json}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD}
       SECRET_KEY: ${SECRET_KEY}
+      COOKIES_FILE: ${COOKIES_FILE:-/app/cookies.txt}
     labels:
       - "traefik.enable=${TRAEFIK_ENABLE:-false}"
       - "traefik.docker.network=${TRAEFIK_NETWORK:-proxy}"
@@ -27,15 +28,9 @@ services:
     volumes:
       - downloads:/app/downloads
       - data:/app/data
-    networks:
-      - traefik
     restart: unless-stopped
 
 volumes:
   downloads:
   data:
 
-networks:
-  traefik:
-    name: ${TRAEFIK_NETWORK:-proxy}
-    external: true

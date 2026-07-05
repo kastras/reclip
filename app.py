@@ -11,7 +11,7 @@ import re
 import secrets
 import subprocess
 import threading
-from flask import Flask, request, jsonify, send_file, render_template
+from flask import Flask, request, jsonify, render_template, redirect, session
 
 try:
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -25,11 +25,28 @@ app.secret_key = os.environ.get("SECRET_KEY") or secrets.token_hex(32)
 DOWNLOAD_DIR = os.path.join(os.path.dirname(__file__), "downloads")
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-ACL_PATH = os.environ.get("ACL_PATH", os.path.join(os.path.dirname(__file__), "data", "acl.json"))
-os.makedirs(os.path.dirname(ACL_PATH), exist_ok=True)
+BASE_DIR = os.path.dirname(__file__)
+COOKIES_FILE = os.environ.get("COOKIES_FILE", os.path.join(BASE_DIR, "cookies.txt"))
+COOKIES_FROM_BROWSER = os.environ.get("COOKIES_FROM_BROWSER", "").strip()
+
+DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
+ADMIN_COOKIES_PATH = os.path.join(DATA_DIR, "cookies_admin.txt")
+os.makedirs(DATA_DIR, exist_ok=True)
+
+ACL_PATH = os.environ.get("ACL_PATH", os.path.join(DATA_DIR, "acl.json"))
+WEB_CODES_PATH = os.environ.get("WEB_CODES_PATH", os.path.join(DATA_DIR, "web_codes.json"))
+DOWNLOAD_LOG_PATH = os.environ.get("DOWNLOAD_LOG_PATH", os.path.join(DATA_DIR, "download_log.json"))
 
 acl_lock = threading.Lock()
+web_codes_lock = threading.Lock()
+download_log_lock = threading.Lock()
 pending_codes: dict[str, dict] = {}
+pending_cookies_setup: dict[int, float] = {}
+
+login_attempts: dict[str, dict] = {}
+login_attempts_lock = threading.Lock()
+MAX_LOGIN_ATTEMPTS = 5
+LOGIN_WINDOW_SECONDS = 900
 
 jobs = {}
 chat_sessions = {}
@@ -48,25 +65,145 @@ def parse_ytdlp_json(stdout):
     raise ValueError("yt-dlp returned no data")
 
 
+def admin_session_active() -> bool:
+    return bool(session.get("admin"))
+
+
+def web_session_active() -> bool:
+    return bool(session.get("web_access"))
+
+
+def web_session_user() -> dict:
+    return session.get("web_access") or {}
+
+
+def json_load_dict(path: str) -> dict:
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def json_load_list(path: str) -> list:
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, list) else []
+    except (json.JSONDecodeError, OSError):
+        return []
+
+
+def json_save(path: str, data) -> None:
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, path)
+
+
 # ---------------------------------------------------------------------------
 # ACL helpers
 # ---------------------------------------------------------------------------
 
 def acl_load() -> dict:
-    if not os.path.exists(ACL_PATH):
-        return {}
-    try:
-        with open(ACL_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (json.JSONDecodeError, OSError):
-        return {}
+    return json_load_dict(ACL_PATH)
 
 
 def acl_save(data: dict) -> None:
-    tmp = ACL_PATH + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
-    os.replace(tmp, ACL_PATH)
+    json_save(ACL_PATH, data)
+
+
+def web_codes_load() -> dict:
+    return json_load_dict(WEB_CODES_PATH)
+
+
+def web_codes_save(data: dict) -> None:
+    json_save(WEB_CODES_PATH, data)
+
+
+def download_log_load() -> list:
+    return json_load_list(DOWNLOAD_LOG_PATH)
+
+
+def download_log_save(entries: list) -> None:
+    json_save(DOWNLOAD_LOG_PATH, entries)
+
+
+def create_web_access_code(label: str) -> str:
+    with web_codes_lock:
+        codes = web_codes_load()
+        code = secrets.token_hex(4).upper()
+        while code in codes:
+            code = secrets.token_hex(4).upper()
+        codes[code] = {
+            "label": label,
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "revoked": False,
+            "use_count": 0,
+            "last_used_at": None,
+        }
+        web_codes_save(codes)
+        return code
+
+
+def use_web_access_code(code: str) -> dict | None:
+    with web_codes_lock:
+        codes = web_codes_load()
+        entry = codes.get(code)
+        if not entry or entry.get("revoked"):
+            return None
+        entry["use_count"] = entry.get("use_count", 0) + 1
+        entry["last_used_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        codes[code] = entry
+        web_codes_save(codes)
+        return entry
+
+
+def log_download_event(source: str, url: str, title: str, format_choice: str, actor: str, filename: str = "") -> None:
+    entry = {
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "source": source,
+        "actor": actor,
+        "format": format_choice,
+        "title": title,
+        "url": url,
+        "filename": filename,
+    }
+    with download_log_lock:
+        entries = download_log_load()
+        entries.insert(0, entry)
+        del entries[200:]
+        download_log_save(entries)
+
+
+def sorted_web_codes() -> list[tuple[str, dict]]:
+    return sorted(web_codes_load().items(), key=lambda item: item[1].get("created_at", ""), reverse=True)
+
+
+@app.before_request
+def require_web_access():
+    path = request.path or "/"
+    if (
+        path.startswith("/static/")
+        or path.startswith("/access")
+        or path.startswith("/admin")
+        or path.startswith("/dl/")
+        or path.startswith("/api/acl/")
+    ):
+        return None
+
+    if admin_session_active() or web_session_active():
+        return None
+
+    if path.startswith("/api/"):
+        return jsonify({"error": "Unauthorized"}), 401
+
+    return redirect("/access")
 
 
 def acl_is_approved(chat_id: int) -> bool:
@@ -132,8 +269,140 @@ def build_quality_options(info):
     return formats
 
 
+NETSCAPE_REQUIRED_FIELDS = 7  # domain, domain_specified, path, secure, expires, name, value
+
+
+def normalize_cookies(content: str) -> tuple[str | None, str | None]:
+    """
+    Normaliza contenido de cookies a formato Netscape con tabuladores.
+    Acepta campos separados por tabuladores o por espacios.
+    Retorna (contenido_normalizado | None, mensaje_error | None).
+    """
+    lines = content.splitlines()
+    out_lines: list[str] = []
+    for i, raw_line in enumerate(lines, 1):
+        stripped = raw_line.strip()
+        if not stripped or stripped.startswith("#"):
+            out_lines.append(raw_line)
+            continue
+
+        if "\t" in raw_line:
+            fields = raw_line.split("\t")
+            fields = [f.strip() for f in fields]
+        else:
+            fields = stripped.split()
+            if len(fields) == 1:
+                return (None,
+                        f"Línea {i}: no se detectaron campos separados. "
+                        f"Asegúrate de usar tabuladores entre los {NETSCAPE_REQUIRED_FIELDS} campos.")
+
+        if len(fields) != NETSCAPE_REQUIRED_FIELDS:
+            return (None,
+                    f"Línea {i}: se esperaban {NETSCAPE_REQUIRED_FIELDS} campos "
+                    f"separados por tabuladores, pero se encontraron {len(fields)}.")
+
+        out_lines.append("\t".join(fields))
+
+    return ("\n".join(out_lines) + "\n", None)
+
+
+def yt_dlp_cookies_args() -> list[str]:
+    args = []
+    if COOKIES_FROM_BROWSER:
+        args += ["--cookies-from-browser", COOKIES_FROM_BROWSER]
+    elif os.path.isfile(ADMIN_COOKIES_PATH):
+        args += ["--cookies", ADMIN_COOKIES_PATH]
+    elif os.path.isfile(COOKIES_FILE):
+        args += ["--cookies", COOKIES_FILE]
+    return args
+
+
+def cookies_admin_status() -> dict:
+    path = ADMIN_COOKIES_PATH
+    if os.path.isfile(path):
+        try:
+            with open(path, "r") as f:
+                content = f.read()
+            normalized, err = normalize_cookies(content)
+            valid = 0
+            if normalized:
+                valid = sum(1 for l in normalized.splitlines()
+                            if l.strip() and not l.startswith("#"))
+            return {"configured": valid > 0, "lines": valid, "path": path,
+                    "content": content, "error": err}
+        except OSError:
+            pass
+    return {"configured": False, "lines": 0, "path": path, "content": "", "error": None}
+
+
+# ---------------------------------------------------------------------------
+# Rate limiting for admin login
+# ---------------------------------------------------------------------------
+
+def get_client_ip() -> str:
+    forwarded = request.headers.get("X-Forwarded-For", "")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.remote_addr or "unknown"
+
+
+def is_login_blocked(ip: str) -> bool:
+    with login_attempts_lock:
+        entry = login_attempts.get(ip)
+        if not entry:
+            return False
+        if time.time() - entry["first_attempt"] > LOGIN_WINDOW_SECONDS:
+            del login_attempts[ip]
+            return False
+        return entry["count"] >= MAX_LOGIN_ATTEMPTS
+
+
+def record_login_attempt(ip: str, success: bool) -> None:
+    with login_attempts_lock:
+        if success:
+            login_attempts.pop(ip, None)
+            return
+        now = time.time()
+        entry = login_attempts.get(ip)
+        if not entry or (now - entry["first_attempt"] > LOGIN_WINDOW_SECONDS):
+            login_attempts[ip] = {"count": 1, "first_attempt": now}
+        else:
+            entry["count"] += 1
+
+
+# ---------------------------------------------------------------------------
+# Periodic cleanup of pending codes
+# ---------------------------------------------------------------------------
+
+def start_cleanup_thread() -> None:
+    def cleanup():
+        while True:
+            time.sleep(300)
+            now = time.time()
+            expired_codes = [
+                code for code, entry in list(pending_codes.items())
+                if now - entry.get("created_at", 0) > 1800
+            ]
+            for code in expired_codes:
+                pending_codes.pop(code, None)
+            if expired_codes:
+                app.logger.info("Cleaned %d expired pending codes", len(expired_codes))
+
+            expired_setup = [
+                cid for cid, ts in list(pending_cookies_setup.items())
+                if now - ts > 1800
+            ]
+            for cid in expired_setup:
+                del pending_cookies_setup[cid]
+
+    thread = threading.Thread(target=cleanup, name="cleanup", daemon=True)
+    thread.start()
+
+
 def fetch_video_info(url, timeout=60):
-    cmd = ["yt-dlp", "--no-playlist", "-j", url]
+    cmd = ["yt-dlp", "--no-playlist", "-j"]
+    cmd += yt_dlp_cookies_args()
+    cmd.append(url)
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     if result.returncode != 0:
         error_line = result.stderr.strip().split("\n")[-1] if result.stderr else "Unknown error"
@@ -153,6 +422,7 @@ def sanitize_filename(title, fallback_name):
 def download_sync(prefix, url, format_choice, format_id=None, title="", timeout=300):
     out_template = os.path.join(DOWNLOAD_DIR, f"{prefix}.%(ext)s")
     cmd = ["yt-dlp", "--no-playlist", "-o", out_template]
+    cmd += yt_dlp_cookies_args()
 
     if format_choice == "audio":
         cmd += ["-x", "--audio-format", "mp3"]
@@ -204,6 +474,14 @@ def run_download(job_id, url, format_choice, format_id):
         job["status"] = "done"
         job["file"] = chosen
         job["filename"] = filename
+        log_download_event(
+            source="web",
+            url=url,
+            title=job.get("title", ""),
+            format_choice=job.get("format", format_choice),
+            actor=job.get("actor", "web"),
+            filename=filename,
+        )
     except subprocess.TimeoutExpired:
         job["status"] = "error"
         job["error"] = "Download timed out (5 min limit)"
@@ -214,7 +492,37 @@ def run_download(job_id, url, format_choice, format_id):
 
 @app.route("/")
 def index():
-    return render_template("index.html")
+    return render_template("index.html", web_user=web_session_user())
+
+
+@app.route("/access", methods=["GET", "POST"])
+def access():
+    if web_session_active() or admin_session_active():
+        return redirect("/")
+
+    error = None
+    if request.method == "POST":
+        code = (request.form.get("code") or "").strip().upper()
+        if not code:
+            error = "Introduce un código de acceso."
+        else:
+            entry = use_web_access_code(code)
+            if not entry:
+                error = "Código inválido o revocado."
+            else:
+                session["web_access"] = {
+                    "code": code,
+                    "label": entry.get("label") or "",
+                }
+                return redirect("/")
+
+    return render_template("access.html", error=error)
+
+
+@app.route("/access/logout", methods=["POST"])
+def access_logout():
+    session.pop("web_access", None)
+    return redirect("/access")
 
 
 @app.route("/admin", methods=["GET", "POST"])
@@ -224,30 +532,53 @@ def admin():
         return "Panel de administracion deshabilitado: ADMIN_PASSWORD no configurado.", 503
 
     error = None
+    message = None
+    generated_web_code = None
     authed = False
 
     if request.method == "POST":
         action = request.form.get("action", "")
 
         if action == "login":
-            if request.form.get("password", "") == admin_password:
-                from flask import session
+            client_ip = get_client_ip()
+            if is_login_blocked(client_ip):
+                error = "Demasiados intentos. Intenta de nuevo mas tarde."
+            elif request.form.get("password", "") == admin_password:
                 session["admin"] = True
+                record_login_attempt(client_ip, success=True)
             else:
+                record_login_attempt(client_ip, success=False)
                 error = "Contraseña incorrecta."
 
+        elif action == "generate_web_code":
+            if session.get("admin"):
+                label = (request.form.get("label") or "").strip()
+                generated_web_code = create_web_access_code(label)
+                message = "Código web generado correctamente."
+
         elif action == "approve":
-            from flask import session
             if session.get("admin"):
                 code = (request.form.get("code") or "").strip().upper()
                 entry = pending_codes.pop(code, None)
                 if entry and time.time() - entry["created_at"] <= 1800:
                     acl_approve(entry["chat_id"], entry["username"], entry["first_name"])
+                    message = "Usuario de Telegram aprobado."
                 else:
                     error = "Código inválido o expirado."
 
+        elif action == "revoke_web_code":
+            if session.get("admin"):
+                code = (request.form.get("code") or "").strip().upper()
+                with web_codes_lock:
+                    codes = web_codes_load()
+                    if code in codes:
+                        codes[code]["revoked"] = True
+                        web_codes_save(codes)
+                        message = "Código web revocado."
+                    else:
+                        error = "Código web no encontrado."
+
         elif action == "block":
-            from flask import session
             if session.get("admin"):
                 chat_id = str(request.form.get("chat_id", "")).strip()
                 with acl_lock:
@@ -255,9 +586,9 @@ def admin():
                     if chat_id in data:
                         data[chat_id]["blocked"] = True
                         acl_save(data)
+                        message = "Usuario bloqueado."
 
         elif action == "unblock":
-            from flask import session
             if session.get("admin"):
                 chat_id = str(request.form.get("chat_id", "")).strip()
                 with acl_lock:
@@ -265,15 +596,54 @@ def admin():
                     if chat_id in data:
                         data[chat_id]["blocked"] = False
                         acl_save(data)
+                        message = "Usuario desbloqueado."
+
+        elif action == "save_cookies":
+            if session.get("admin"):
+                content = request.form.get("cookies_content", "").strip()
+                if content:
+                    normalized, err = normalize_cookies(content)
+                    if err:
+                        error = f"Formato inválido: {err}"
+                    else:
+                        try:
+                            with open(ADMIN_COOKIES_PATH, "w", encoding="utf-8") as f:
+                                f.write(normalized)
+                            message = "Cookies guardadas correctamente."
+                        except OSError:
+                            error = "Error al guardar el archivo de cookies."
+                else:
+                    error = "No hay contenido de cookies para guardar."
+
+        elif action == "clear_cookies":
+            if session.get("admin"):
+                try:
+                    if os.path.isfile(ADMIN_COOKIES_PATH):
+                        os.remove(ADMIN_COOKIES_PATH)
+                    message = "Cookies eliminadas."
+                except OSError:
+                    error = "Error al eliminar las cookies."
 
         elif action == "logout":
-            from flask import session
             session.pop("admin", None)
+            return redirect("/admin")
 
-    from flask import session
     authed = session.get("admin", False)
     users = acl_load() if authed else {}
-    return render_template("admin.html", authed=authed, users=users, error=error)
+    web_codes = sorted_web_codes() if authed else []
+    download_logs = download_log_load()[:100] if authed else []
+    cookies_status = cookies_admin_status() if authed else {"configured": False}
+    return render_template(
+        "admin.html",
+        authed=authed,
+        users=users,
+        web_codes=web_codes,
+        download_logs=download_logs,
+        cookies_status=cookies_status,
+        error=error,
+        message=message,
+        generated_web_code=generated_web_code,
+    )
 
 
 @app.route("/api/info", methods=["POST"])
@@ -377,7 +747,43 @@ async def telegram_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def telegram_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Pega un enlace (YouTube, TikTok, Instagram, etc.) y elige una opcion del menu.")
+    await update.message.reply_text(
+        "Comandos disponibles:\n"
+        "/start — Obtener codigo de acceso\n"
+        "/cookies — Configurar cookies para sitios que requieren autenticacion\n"
+        "/help — Esta ayuda\n\n"
+        "O envia un enlace para descargar."
+    )
+
+
+async def telegram_cookies(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+    chat_id = update.effective_chat.id
+    if not acl_is_approved(chat_id):
+        await update.message.reply_text("No tienes acceso. Usa /start primero.")
+        return
+
+    pending_cookies_setup[chat_id] = time.time()
+    await update.message.reply_text(
+        "Enviame el contenido de cookies.txt en formato Netscape.\n\n"
+        "Pega el texto completo en un solo mensaje.\n\n"
+        "Ejemplo:\n"
+        "<code>.instagram.com  TRUE  /  FALSE  0  sessionid  abc123...</code>\n\n"
+        "Para cancelar, usa /cancel.",
+        parse_mode="HTML",
+    )
+
+
+async def telegram_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+    chat_id = update.effective_chat.id
+    removed = pending_cookies_setup.pop(chat_id, None)
+    if removed:
+        await update.message.reply_text("Operacion cancelada.")
+    else:
+        await update.message.reply_text("No hay ninguna operacion pendiente de cancelar.")
 
 
 async def telegram_on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -389,6 +795,32 @@ async def telegram_on_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text(
             "No tienes acceso. Usa /start para obtener tu codigo de acceso e introdicelo en la web."
         )
+        return
+
+    if chat_id in pending_cookies_setup:
+        content = (update.message.text or "").strip()
+        if not content:
+            await update.message.reply_text("No recibi contenido. Envia el texto de las cookies o usa /cancel.")
+            return
+        normalized, err = normalize_cookies(content)
+        if err:
+            await update.message.reply_text(
+                f"Formato invalido: {err}\n\n"
+                "Asegurate de exportar las cookies en formato Netscape "
+                "(campos separados por tabuladores).\n"
+                "Usa /cancel para salir o vuelve a enviar el contenido."
+            )
+            return
+        try:
+            with open(ADMIN_COOKIES_PATH, "w", encoding="utf-8") as f:
+                f.write(normalized)
+            await update.message.reply_text(
+                "Cookies guardadas correctamente. Ya puedes descargar desde sitios que requieren autenticacion."
+            )
+        except OSError:
+            await update.message.reply_text("Error al guardar las cookies. Intenta de nuevo o usa el panel web.")
+        finally:
+            del pending_cookies_setup[chat_id]
         return
 
     url = first_url_from_text(update.message.text or "")
@@ -512,6 +944,14 @@ async def telegram_on_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             format_choice=format_choice,
             format_id=format_id,
         )
+        actor = query.from_user.username or query.from_user.first_name or str(chat_id)
+        log_download_event(
+            source="telegram",
+            url=session["url"],
+            title=session.get("title", ""),
+            format_choice=format_choice,
+            actor=actor,
+        )
         await context.bot.send_message(chat_id=chat_id, text="Listo. Si quieres otro, enviame otro enlace.")
         acl_increment_downloads(chat_id)
     except subprocess.TimeoutExpired:
@@ -543,6 +983,8 @@ def start_telegram_bot():
         application = Application.builder().token(token).build()
         application.add_handler(CommandHandler("start", telegram_start))
         application.add_handler(CommandHandler("help", telegram_help))
+        application.add_handler(CommandHandler("cookies", telegram_cookies))
+        application.add_handler(CommandHandler("cancel", telegram_cancel))
         application.add_handler(CallbackQueryHandler(telegram_on_callback))
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, telegram_on_message))
         try:
@@ -571,6 +1013,9 @@ def start_telegram_bot():
 
 @app.route("/api/acl/approve", methods=["POST"])
 def acl_approve_code():
+    if not admin_session_active():
+        return jsonify({"error": "Unauthorized"}), 401
+
     data = request.json or {}
     code = (data.get("code") or "").strip().upper()
     if not code:
@@ -589,11 +1034,16 @@ def acl_approve_code():
 
 @app.route("/api/acl/users", methods=["GET"])
 def acl_list_users():
+    if not admin_session_active():
+        return jsonify({"error": "Unauthorized"}), 401
     return jsonify(acl_load())
 
 
 @app.route("/api/acl/block", methods=["POST"])
 def acl_block_user():
+    if not admin_session_active():
+        return jsonify({"error": "Unauthorized"}), 401
+
     data = request.json or {}
     chat_id = str(data.get("chat_id", "")).strip()
     if not chat_id:
@@ -609,6 +1059,9 @@ def acl_block_user():
 
 @app.route("/api/acl/unblock", methods=["POST"])
 def acl_unblock_user():
+    if not admin_session_active():
+        return jsonify({"error": "Unauthorized"}), 401
+
     data = request.json or {}
     chat_id = str(data.get("chat_id", "")).strip()
     if not chat_id:
@@ -661,7 +1114,15 @@ def start_download():
         return jsonify({"error": "No URL provided"}), 400
 
     job_id = uuid.uuid4().hex[:10]
-    jobs[job_id] = {"status": "downloading", "url": url, "title": title}
+    web_user = web_session_user()
+    actor = web_user.get("label") or web_user.get("code") or "web"
+    jobs[job_id] = {
+        "status": "downloading",
+        "url": url,
+        "title": title,
+        "format": format_choice,
+        "actor": actor,
+    }
 
     thread = threading.Thread(target=run_download, args=(job_id, url, format_choice, format_id))
     thread.daemon = True
@@ -687,11 +1148,34 @@ def download_file(job_id):
     job = jobs.get(job_id)
     if not job or job["status"] != "done":
         return jsonify({"error": "File not ready"}), 404
-    return send_file(job["file"], as_attachment=True, download_name=job["filename"])
+
+    path = job["file"]
+    filename = job["filename"]
+    jobs.pop(job_id, None)
+
+    if not os.path.exists(path):
+        return jsonify({"error": "File not ready"}), 404
+
+    def stream_and_delete():
+        try:
+            with open(path, "rb") as f:
+                yield from f
+        finally:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+    from flask import Response, stream_with_context
+    import mimetypes
+    mime = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+    headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+    return Response(stream_with_context(stream_and_delete()), headers=headers, mimetype=mime)
 
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
+    start_cleanup_thread()
     start_telegram_bot()
     port = int(os.environ.get("PORT", 8899))
     host = os.environ.get("HOST", "127.0.0.1")
