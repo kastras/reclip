@@ -401,6 +401,14 @@
     <div id="cards" class="cards"></div>
 
     <div class="footer">
+      {% if web_user %}
+      <div style="margin-bottom:14px;font-size:0.66rem;letter-spacing:0.05em;">
+        Acceso activo: {{ web_user.label or web_user.code }}
+        <form method="POST" action="/access/logout" style="display:inline-block;margin-left:8px;">
+          <button type="submit" style="border:none;background:none;color:var(--muted);font:inherit;cursor:pointer;text-transform:uppercase;letter-spacing:0.05em;">Salir</button>
+        </form>
+      </div>
+      {% endif %}
       YouTube &middot; TikTok &middot; Instagram &middot; Twitter/X &middot; Reddit &middot; Facebook<br>
       Vimeo &middot; Twitch &middot; Dailymotion &middot; SoundCloud &middot; Loom &middot; Streamable<br>
       Pinterest &middot; Tumblr &middot; Threads &middot; LinkedIn &middot; 1000+ more<br><br>
@@ -643,6 +651,13 @@
         try {
           const res = await fetch(`/api/status/${c.jobId}`);
           const data = await res.json();
+          if (!res.ok || data.error) {
+            clearInterval(iv);
+            c.status = 'error';
+            c.error = data.error || 'Lost access to server';
+            renderCard(idx);
+            return;
+          }
           if (data.status === 'done') {
             clearInterval(iv);
             c.status = 'done';

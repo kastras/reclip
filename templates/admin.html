@@ -91,6 +91,11 @@
       font-size: 0.78rem;
       margin-bottom: 12px;
     }
+    .ok-msg {
+      color: var(--success);
+      font-size: 0.78rem;
+      margin-bottom: 12px;
+    }
 
     /* Panel */
     .section { margin-bottom: 40px; }
@@ -154,13 +159,26 @@
       color: var(--muted);
       margin-top: 8px;
     }
+    .code-box {
+      margin-top: 12px;
+      padding: 12px 14px;
+      border-radius: 8px;
+      background: rgba(45, 138, 78, 0.08);
+      color: var(--success);
+      font-size: 0.8rem;
+    }
+    .url-cell {
+      word-break: break-all;
+      color: var(--muted);
+      max-width: 280px;
+    }
   </style>
 </head>
 <body>
   <div class="page">
     <div class="brand">
       <h1>Re<em>Clip</em> <span style="font-family:'DM Mono',monospace;font-size:1.2rem;font-weight:400;">Admin</span></h1>
-      <p>Control de acceso Telegram</p>
+      <p>Control de acceso web y Telegram</p>
     </div>
 
     {% if not authed %}
@@ -186,6 +204,69 @@
       </div>
 
       {% if error %}<p class="error-msg" style="margin-bottom:16px;">{{ error }}</p>{% endif %}
+      {% if message %}<p class="ok-msg" style="margin-bottom:16px;">{{ message }}</p>{% endif %}
+
+      <div class="section">
+        <h2>Generar código web</h2>
+        <form method="POST">
+          <input type="hidden" name="action" value="generate_web_code">
+          <div class="approve-row">
+            <input type="text" name="label" placeholder="Etiqueta opcional (ej. Marta, Oficina, Casa)">
+            <button class="btn btn-primary btn-sm" type="submit">Generar</button>
+          </div>
+        </form>
+        {% if generated_web_code %}
+          <div class="code-box">
+            Código generado: <strong>{{ generated_web_code }}</strong>
+          </div>
+        {% endif %}
+      </div>
+
+      <div class="section">
+        <h2>Códigos web ({{ web_codes | length }})</h2>
+        {% if web_codes %}
+        <table>
+          <thead>
+            <tr>
+              <th>Código</th>
+              <th>Etiqueta</th>
+              <th>Estado</th>
+              <th style="text-align:right;">Usos</th>
+              <th>Último acceso</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for code, entry in web_codes %}
+            <tr>
+              <td>{{ code }}</td>
+              <td>{{ entry.label or 'Sin etiqueta' }}</td>
+              <td>
+                {% if entry.revoked %}
+                  <span class="badge badge-blocked">Revocado</span>
+                {% else %}
+                  <span class="badge badge-ok">Activo</span>
+                {% endif %}
+              </td>
+              <td style="text-align:right;">{{ entry.use_count or 0 }}</td>
+              <td style="color:var(--muted);">{{ entry.last_used_at or 'Nunca' }}</td>
+              <td style="text-align:right;">
+                {% if not entry.revoked %}
+                <form method="POST" style="display:inline">
+                  <input type="hidden" name="action" value="revoke_web_code">
+                  <input type="hidden" name="code" value="{{ code }}">
+                  <button class="btn btn-sm btn-danger" type="submit">Revocar</button>
+                </form>
+                {% endif %}
+              </td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+        {% else %}
+          <p style="font-size:0.8rem;color:var(--muted);">Aún no hay códigos web generados.</p>
+        {% endif %}
+      </div>
 
       <!-- Aprobar código -->
       <div class="section">
@@ -198,6 +279,40 @@
           </div>
         </form>
         <p class="pending-notice">Los códigos expiran a los 30 minutos de ser generados por el bot.</p>
+      </div>
+
+      <!-- Cookies -->
+      <div class="section">
+        <h2>Cookies para descargas</h2>
+        <p style="font-size:0.78rem;color:var(--muted);margin-bottom:12px;">
+          Algunos sitios (Instagram, Twitter/X, etc.) requieren cookies para descargar.
+          Usa una extensi&oacute;n como
+          <a href="https://chrome.google.com/webstore/detail/get-cookiestxt/bgaddhkoddajcdgocldbbfleckgcbcid" target="_blank" style="color:var(--accent);">"Get cookies.txt"</a>
+          para exportar tus cookies desde el navegador y p&eacute;galas abajo.
+        </p>
+        {% if cookies_status.error %}
+          <p class="err-msg" style="margin-bottom:12px;color:var(--danger);">
+            Error: {{ cookies_status.error }}
+          </p>
+        {% endif %}
+        {% if cookies_status.configured %}
+          <p class="ok-msg" style="margin-bottom:12px;">
+            Cookies configuradas &mdash; {{ cookies_status.lines }} cookies v&aacute;lidas.
+          </p>
+        {% else %}
+          <p style="font-size:0.78rem;color:var(--muted);margin-bottom:12px;">
+            No hay cookies configuradas desde el panel.
+          </p>
+        {% endif %}
+        <form method="POST" style="margin-bottom:8px;">
+          <input type="hidden" name="action" value="save_cookies">
+          <textarea name="cookies_content" rows="8" style="width:100%;padding:12px 14px;border:1.5px solid var(--card-border);border-radius:8px;background:var(--bg);font-family:'DM Mono',monospace;font-size:0.75rem;color:var(--fg);outline:none;resize:vertical;margin-bottom:10px;" placeholder="Pega aqu&iacute; el contenido de cookies.txt (formato Netscape)&#10;&#10;Ejemplo:&#10;.instagram.com	TRUE	/	FALSE	0	sessionid	abc123...">{% if cookies_status.configured %}{{ cookies_status.content }}{% endif %}</textarea>
+          <button class="btn btn-primary btn-sm" type="submit">Guardar cookies</button>
+        </form>
+        <form method="POST">
+          <input type="hidden" name="action" value="clear_cookies">
+          <button class="btn btn-sm btn-danger" type="submit">Eliminar cookies</button>
+        </form>
       </div>
 
       <!-- Usuarios -->
@@ -251,6 +366,38 @@
         </table>
         {% else %}
           <p style="font-size:0.8rem;color:var(--muted);">Aún no hay usuarios aprobados.</p>
+        {% endif %}
+      </div>
+
+      <div class="section">
+        <h2>Descargas recientes ({{ download_logs | length }})</h2>
+        {% if download_logs %}
+        <table>
+          <thead>
+            <tr>
+              <th>Fecha</th>
+              <th>Origen</th>
+              <th>Usuario</th>
+              <th>Formato</th>
+              <th>Título</th>
+              <th>URL</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for item in download_logs %}
+            <tr>
+              <td style="color:var(--muted);">{{ item.timestamp }}</td>
+              <td>{{ item.source }}</td>
+              <td>{{ item.actor or 'desconocido' }}</td>
+              <td>{{ item.format }}</td>
+              <td>{{ item.title or 'Sin título' }}</td>
+              <td class="url-cell">{{ item.url }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+        {% else %}
+          <p style="font-size:0.8rem;color:var(--muted);">Todavía no hay descargas registradas.</p>
         {% endif %}
       </div>
 

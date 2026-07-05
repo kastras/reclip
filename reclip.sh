@@ -43,7 +43,13 @@ fi
 PORT="${PORT:-8899}"
 export PORT
 
-echo ""
+cookies_file="${COOKIES_FILE:-cookies.txt}"
+if [ ! -f "$cookies_file" ] && [ -z "$COOKIES_FROM_BROWSER" ]; then
+    echo "  Hint: for Instagram/Twitter/etc. place a cookies.txt file or"
+    echo "  set COOKIES_FROM_BROWSER=chrome in .env"
+    echo ""
+fi
+
 echo "  ReClip is running at http://localhost:$PORT"
 echo ""
 python3 app.py
