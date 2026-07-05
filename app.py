@@ -1077,12 +1077,13 @@ def acl_unblock_user():
 
 @app.route("/dl/<token>")
 def download_by_token(token):
-    entry = download_tokens.pop(token, None)
+    entry = download_tokens.get(token)
     if not entry:
         return "Enlace no valido o ya utilizado.", 404
     path = entry["path"]
     filename = entry["filename"]
     if not os.path.exists(path):
+        download_tokens.pop(token, None)
         return "El archivo ya no esta disponible.", 410
 
     def stream_and_delete():
@@ -1094,6 +1095,7 @@ def download_by_token(token):
                 os.remove(path)
             except OSError:
                 pass
+            download_tokens.pop(token, None)
 
     from flask import Response, stream_with_context
     import mimetypes
@@ -1151,9 +1153,9 @@ def download_file(job_id):
 
     path = job["file"]
     filename = job["filename"]
-    jobs.pop(job_id, None)
 
     if not os.path.exists(path):
+        jobs.pop(job_id, None)
         return jsonify({"error": "File not ready"}), 404
 
     def stream_and_delete():
@@ -1165,6 +1167,7 @@ def download_file(job_id):
                 os.remove(path)
             except OSError:
                 pass
+            jobs.pop(job_id, None)
 
     from flask import Response, stream_with_context
     import mimetypes
