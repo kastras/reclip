@@ -1048,6 +1048,50 @@ def acl_unblock_user():
 
 
 @app.route("/dl/<token>")
+def download_page(token):
+    entry = download_tokens.get(token)
+    if not entry:
+        return "Enlace no valido o ya utilizado.", 404
+    path = entry["path"]
+    filename = entry["filename"]
+    if not os.path.exists(path):
+        download_tokens.pop(token, None)
+        return "El archivo ya no esta disponible.", 410
+
+    from flask import render_template_string
+    return render_template_string("""<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Descargar — ReClip</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:'DM Mono',monospace;background:#f4f1eb;color:#3a3a38;min-height:100vh;display:flex;align-items:center;justify-content:center}
+body::after{content:'';position:fixed;inset:0;opacity:0.03;pointer-events:none;background-image:url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noise'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noise)'/%3E%3C/svg%3E");background-size:128px}
+.card{background:#fff;border:1.5px solid #e2ded6;border-radius:14px;padding:48px 40px;text-align:center;max-width:440px;width:90%;position:relative;z-index:1}
+.card h1{font-family:'Instrument Serif',serif;font-size:2.4rem;font-weight:400;letter-spacing:-0.03em;margin-bottom:12px}
+.card h1 em{font-style:italic;color:#e85d2a}
+.card p{font-size:0.8rem;color:#9c9889;margin-bottom:32px;line-height:1.6}
+.btn{display:inline-block;background:#e85d2a;color:#fff;text-decoration:none;padding:14px 40px;border-radius:10px;font-family:'DM Mono',monospace;font-size:0.85rem;letter-spacing:0.03em;transition:background 0.2s}
+.btn:hover{background:#d04e1f}
+.note{font-size:0.68rem;color:#9c9889;margin-top:20px}
+</style>
+</head>
+<body>
+<div class="card">
+<h1><em>↓</em> Descargar</h1>
+<p>Haz clic en el boton para descargar <strong>{{ filename }}</strong>.<br>El enlace expira tras la primera descarga.</p>
+<a class="btn" href="/dl/{{ token }}/download">Descargar archivo</a>
+<p class="note">El archivo se eliminara automaticamente despues de la descarga.</p>
+</div>
+</body>
+</html>""", filename=filename, token=token)
+
+
+@app.route("/dl/<token>/download")
 def download_by_token(token):
     entry = download_tokens.get(token)
     if not entry:
