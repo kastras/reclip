@@ -69,6 +69,7 @@ def admin_session_active() -> bool:
     return bool(session.get("admin"))
 
 
+
 def web_session_active() -> bool:
     return bool(session.get("web_access"))
 
@@ -250,6 +251,7 @@ def format_duration(total_seconds):
 
 
 def build_quality_options(info):
+
     best_by_height = {}
     for f in info.get("formats", []):
         height = f.get("height")
@@ -695,6 +697,7 @@ def get_playlist_info():
         return jsonify({"error": str(e)}), 400
 
 
+
 def build_telegram_menu(formats):
     buttons = [[
         InlineKeyboardButton("Video (mejor)", callback_data="dl|best"),
@@ -884,6 +887,7 @@ async def telegram_send_download(chat_id, bot, url, title, format_choice, format
                     f"Descargalo desde este enlace (expira tras la primera descarga):\n{link}"
                 ),
             )
+
             return
         with open(path, "rb") as f:
             await bot.send_document(chat_id=chat_id, document=f, filename=filename)
@@ -1024,6 +1028,7 @@ def acl_approve_code():
     entry = pending_codes.pop(code, None)
     if not entry:
         return jsonify({"error": "Invalid or expired code"}), 404
+
 
     if time.time() - entry["created_at"] > 1800:
         return jsonify({"error": "Code has expired"}), 410
