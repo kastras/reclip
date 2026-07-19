@@ -400,7 +400,7 @@ def start_cleanup_thread() -> None:
 
 
 def fetch_video_info(url, timeout=60):
-    cmd = ["yt-dlp", "--no-playlist", "-j"]
+    cmd = ["yt-dlp", "--no-playlist", "--socket-timeout", "30", "-j"]
     cmd += yt_dlp_cookies_args()
     cmd.append(url)
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
@@ -421,7 +421,7 @@ def sanitize_filename(title, fallback_name):
 
 def download_sync(prefix, url, format_choice, format_id=None, title="", timeout=300):
     out_template = os.path.join(DOWNLOAD_DIR, f"{prefix}.%(ext)s")
-    cmd = ["yt-dlp", "--no-playlist", "-o", out_template]
+    cmd = ["yt-dlp", "--no-playlist", "--socket-timeout", "30", "-o", out_template]
     cmd += yt_dlp_cookies_args()
 
     if format_choice == "audio":
@@ -679,7 +679,7 @@ def get_playlist_info():
     if not url:
         return jsonify({"error": "No URL provided"}), 400
 
-    cmd = ["yt-dlp", "--flat-playlist", "-J", url]
+    cmd = ["yt-dlp", "--flat-playlist", "--socket-timeout", "30", "-J", url]
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
         if result.returncode != 0:
@@ -1220,10 +1220,11 @@ def download_file(job_id):
     return Response(stream_with_context(stream_and_delete()), headers=headers, mimetype=mime)
 
 
+start_cleanup_thread()
+start_telegram_bot()
+
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    start_cleanup_thread()
-    start_telegram_bot()
     port = int(os.environ.get("PORT", 8899))
     host = os.environ.get("HOST", "127.0.0.1")
     app.run(host=host, port=port)
