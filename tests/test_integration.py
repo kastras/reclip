@@ -1,11 +1,14 @@
 import asyncio
 import importlib
+import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import time
 import unittest
+import zipfile
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -299,6 +302,51 @@ class ApiIntegrationTests(unittest.TestCase):
         response = self.client.post("/api/info", json={"url": ""})
         self.assertEqual(response.status_code, 400)
 
+    @patch("app.subprocess.run")
+    def test_api_info_image_post(self, mock_run):
+        self.grant_web_session()
+        fake_stdout = json.dumps({
+            "id": "abc123",
+            "title": "Foto de prueba",
+            "thumbnail": "https://example.com/thumb.jpg",
+            "uploader": "testuser",
+            "duration": None,
+            "formats": [
+                {"format_id": "img", "ext": "jpg", "url": "https://example.com/img.jpg"},
+            ],
+        })
+        mock_run.return_value = Mock(returncode=0, stdout=fake_stdout, stderr="")
+
+        response = self.client.post("/api/info", json={"url": "https://instagram.com/p/abc123/"})
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertTrue(data["is_image"])
+        self.assertEqual(data["title"], "Foto de prueba")
+        self.assertEqual(data["formats"], [])
+
+    @patch("app.subprocess.run")
+    def test_api_info_no_video_error_returns_image(self, mock_run):
+        self.grant_web_session()
+        mock_run.return_value = Mock(
+            returncode=1,
+            stdout="",
+            stderr="ERROR: [Instagram] abc: There is no video in this post",
+        )
+
+        response = self.client.post("/api/info", json={"url": "https://instagram.com/p/abc/"})
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertTrue(data["is_image"])
+
+    @patch("app.subprocess.run")
+    def test_api_info_unrelated_error_stays_error(self, mock_run):
+        self.grant_web_session()
+        mock_run.return_value = Mock(returncode=1, stdout="", stderr="ERROR: Login required")
+
+        response = self.client.post("/api/info", json={"url": "https://instagram.com/p/private/"})
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("error", response.get_json())
+
     # -- API /api/playlist --
 
     @patch("app.subprocess.run")
@@ -355,6 +403,113 @@ class ApiIntegrationTests(unittest.TestCase):
         self.grant_web_session()
         response = self.client.post("/api/download", json={})
         self.assertEqual(response.status_code, 400)
+
+    @patch("app.gallery_dl_fetch")
+    def test_download_api_image_single_file(self, mock_fetch):
+        self.grant_web_session()
+        src = Path(self.temp_dir.name) / "photo.jpg"
+        src.write_bytes(b"image-bytes")
+        downloads_dir = str(Path(self.temp_dir.name) / "downloads")
+        os.makedirs(downloads_dir, exist_ok=True)
+        mock_fetch.return_value = [(str(src), "photo.jpg")]
+
+        with patch.object(self.app_module, "DOWNLOAD_DIR", downloads_dir):
+            with patch.object(self.app_module.threading, "Thread", ImmediateThread):
+                response = self.client.post(
+                    "/api/download",
+                    json={
+                        "url": "https://example.com/img",
+                        "format": "image",
+                        "title": "Foto",
+                    },
+                )
+
+            self.assertEqual(response.status_code, 200)
+            job_id = response.get_json()["job_id"]
+
+            status_response = self.client.get(f"/api/status/{job_id}")
+            self.assertEqual(status_response.get_json()["status"], "done")
+            self.assertEqual(status_response.get_json()["filename"], "Foto.jpg")
+
+            file_response = self.client.get(f"/api/file/{job_id}")
+            self.assertEqual(file_response.data, b"image-bytes")
+
+    @patch("app.gallery_dl_fetch")
+    def test_download_api_image_carousel_asks_and_serves_loose_or_zip(self, mock_fetch):
+        self.grant_web_session()
+        files = []
+        for i in range(3):
+            p = Path(self.temp_dir.name) / f"slide{i}.jpg"
+            p.write_bytes(f"data{i}".encode())
+            files.append((str(p), f"slide{i}.jpg"))
+        downloads_dir = str(Path(self.temp_dir.name) / "downloads")
+        workdir = os.path.join(downloads_dir, "carjob")
+        os.makedirs(workdir, exist_ok=True)
+        mock_fetch.return_value = files
+
+        with patch.object(self.app_module, "DOWNLOAD_DIR", downloads_dir):
+            with patch.object(self.app_module.threading, "Thread", ImmediateThread):
+                response = self.client.post(
+                    "/api/download",
+                    json={"url": "https://example.com/carousel", "format": "image", "title": "Carrusel"},
+                )
+            job_id = response.get_json()["job_id"]
+
+            status = self.client.get(f"/api/status/{job_id}").get_json()
+            self.assertEqual(status["status"], "done")
+            self.assertEqual(status["files_count"], 3)
+
+            first = self.client.get(f"/api/file/{job_id}/0")
+            self.assertEqual(first.data, b"data0")
+            self.assertIn("slide0.jpg", first.headers["Content-Disposition"])
+
+            again = self.client.get(f"/api/file/{job_id}/0")
+            self.assertEqual(again.status_code, 404)
+
+            second = self.client.get(f"/api/file/{job_id}/1")
+            self.assertEqual(second.data, b"data1")
+
+            out_of_range = self.client.get(f"/api/file/{job_id}/9")
+            self.assertEqual(out_of_range.status_code, 404)
+
+            zipped = self.client.get(f"/api/zip/{job_id}")
+            self.assertEqual(zipped.status_code, 200)
+            self.assertEqual(zipped.headers["Content-Type"], "application/zip")
+            with zipfile.ZipFile(io.BytesIO(zipped.data)) as zf:
+                self.assertEqual(sorted(zf.namelist()), ["slide2.jpg"])
+
+            gone = self.client.get(f"/api/zip/{job_id}")
+            self.assertEqual(gone.status_code, 404)
+
+    @patch("app.gallery_dl_fetch")
+    def test_download_api_image_ten_files_becomes_zip(self, mock_fetch):
+        self.grant_web_session()
+        files = []
+        for i in range(10):
+            p = Path(self.temp_dir.name) / f"big{i}.jpg"
+            p.write_bytes(f"z{i}".encode())
+            files.append((str(p), f"big{i}.jpg"))
+        downloads_dir = str(Path(self.temp_dir.name) / "downloads")
+        workdir = os.path.join(downloads_dir, "zipjob")
+        os.makedirs(workdir, exist_ok=True)
+        mock_fetch.return_value = files
+
+        with patch.object(self.app_module, "DOWNLOAD_DIR", downloads_dir):
+            with patch.object(self.app_module.threading, "Thread", ImmediateThread):
+                response = self.client.post(
+                    "/api/download",
+                    json={"url": "https://example.com/many", "format": "image"},
+                )
+            job_id = response.get_json()["job_id"]
+
+            status = self.client.get(f"/api/status/{job_id}").get_json()
+            self.assertEqual(status["status"], "done")
+            self.assertTrue(status["filename"].endswith(".zip"))
+
+            served = self.client.get(f"/api/file/{job_id}")
+            self.assertEqual(served.status_code, 200)
+            with zipfile.ZipFile(io.BytesIO(served.data)) as zf:
+                self.assertEqual(len(zf.namelist()), 10)
 
     def test_status_unknown_job(self):
         self.grant_web_session()
@@ -618,6 +773,13 @@ class TelegramIntegrationTests(unittest.TestCase):
         menu = self.app_module.build_telegram_menu([])
         self.assertEqual(len(menu.inline_keyboard), 2)
 
+    def test_build_telegram_menu_image_mode(self):
+        menu = self.app_module.build_telegram_menu([], is_image=True)
+        self.assertEqual(len(menu.inline_keyboard), 2)
+        self.assertEqual(menu.inline_keyboard[0][0].callback_data, "dl|image")
+        self.assertEqual(menu.inline_keyboard[0][0].text, "Imagen")
+        self.assertEqual(menu.inline_keyboard[1][0].callback_data, "dl|cancel")
+
     # -- Telegram start handler --
 
     def test_telegram_start_unapproved_user(self):
@@ -745,6 +907,67 @@ class TelegramIntegrationTests(unittest.TestCase):
             self.assertEqual(self.app_module.chat_sessions[4001]["url"], "https://youtube.com/watch?v=test")
             update.message.reply_text.assert_awaited()
 
+    def test_telegram_on_message_image_post_shows_image_menu(self):
+        self.app_module.acl_approve(chat_id=4101, username="imgtest", first_name="Img")
+        self.app_module.chat_sessions.clear()
+
+        info = {
+            "_type": "playlist",
+            "title": "Post by imgtest",
+            "entries": [
+                {"formats": [{"format_id": "0", "ext": "jpg"}]},
+                {"formats": [{"format_id": "1", "ext": "jpg"}]},
+            ],
+        }
+
+        with patch.object(self.app_module, "fetch_video_info", return_value=info):
+            update = self._mock_update(message_text="https://instagram.com/p/carousel/", chat_id=4101)
+            context = self._mock_context()
+
+            self._run_async(self.app_module.telegram_on_message(update, context))
+
+        session = self.app_module.chat_sessions[4101]
+        self.assertTrue(session["is_image"])
+        loading = update.message.reply_text.return_value
+        _, kwargs = loading.edit_text.call_args
+        self.assertEqual(kwargs["reply_markup"].inline_keyboard[0][0].callback_data, "dl|image")
+
+    def test_telegram_on_message_no_video_error_treated_as_image(self):
+        self.app_module.acl_approve(chat_id=4102, username="imgtest2", first_name="Img2")
+        self.app_module.chat_sessions.clear()
+
+        with patch.object(
+            self.app_module,
+            "fetch_video_info",
+            side_effect=ValueError("ERROR: [Instagram] abc: There is no video in this post"),
+        ):
+            update = self._mock_update(message_text="https://instagram.com/p/photo/", chat_id=4102)
+            context = self._mock_context()
+
+            self._run_async(self.app_module.telegram_on_message(update, context))
+
+        session = self.app_module.chat_sessions[4102]
+        self.assertTrue(session["is_image"])
+        update.message.reply_text.return_value.edit_text.assert_awaited_once()
+
+    def test_telegram_on_message_other_errors_reported(self):
+        self.app_module.acl_approve(chat_id=4103, username="vidfail", first_name="Fail")
+        self.app_module.chat_sessions.clear()
+
+        with patch.object(
+            self.app_module,
+            "fetch_video_info",
+            side_effect=ValueError("ERROR: Unsupported URL"),
+        ):
+            update = self._mock_update(message_text="https://bad.example/x", chat_id=4103)
+            context = self._mock_context()
+
+            self._run_async(self.app_module.telegram_on_message(update, context))
+
+        self.assertNotIn(4103, self.app_module.chat_sessions)
+        args, _ = update.message.reply_text.return_value.edit_text.call_args
+        self.assertIn("No pude leer ese enlace", args[0])
+
     # -- Telegram callback handler --
 
     def test_telegram_on_callback_cancel(self):
@@ -776,6 +999,134 @@ class TelegramIntegrationTests(unittest.TestCase):
 
         update.callback_query.answer.assert_awaited_once()
         update.callback_query.edit_message_text.assert_not_called()
+
+    def test_telegram_on_callback_image_download(self):
+        self.app_module.acl_approve(chat_id=5101, username="imgdl", first_name="ImgDL")
+        self.app_module.chat_sessions[5101] = {
+            "url": "https://example.com/img",
+            "title": "Foto",
+            "formats": [],
+            "is_image": True,
+        }
+        update = self._mock_callback_update("dl|image", chat_id=5101)
+        context = self._mock_context()
+
+        with patch.object(self.app_module, "telegram_send_download", new_callable=AsyncMock) as mock_send:
+            self._run_async(self.app_module.telegram_on_callback(update, context))
+
+        kwargs = mock_send.await_args.kwargs
+        self.assertEqual(kwargs["format_choice"], "image")
+        self.assertEqual(kwargs["url"], "https://example.com/img")
+        self.assertEqual(context.bot.send_message.await_args.kwargs["text"], "Listo. Si quieres otro, enviame otro enlace.")
+
+    def _make_pending_session(self, chat_id, count=2):
+        workdir = Path(self.temp_dir.name) / f"tg_{chat_id}"
+        workdir.mkdir(parents=True, exist_ok=True)
+        files = []
+        for i in range(count):
+            p = workdir / f"f{i}.jpg"
+            p.write_bytes(f"tg{i}".encode())
+            files.append((str(p), f"f{i}.jpg"))
+        session = {
+            "url": "https://example.com/carousel",
+            "title": "Post",
+            "formats": [],
+            "is_image": True,
+            "images_pending": {
+                "prefix": f"tg_{chat_id}",
+                "workdir": str(workdir),
+                "files": files,
+                "url": "https://example.com/carousel",
+                "title": "Post",
+                "created_at": time.time(),
+            },
+        }
+        self.app_module.chat_sessions[chat_id] = session
+        return session
+
+    def test_telegram_images_pending_loose_sends_each_document(self):
+        self._make_pending_session(5201, count=3)
+        update = self._mock_callback_update("img|loose", chat_id=5201)
+        context = self._mock_context()
+
+        self._run_async(self.app_module.telegram_on_callback(update, context))
+
+        self.assertEqual(context.bot.send_document.await_count, 3)
+        names = [kwargs["filename"] for _a, kwargs in context.bot.send_document.await_args_list]
+        self.assertEqual(names, ["f0.jpg", "f1.jpg", "f2.jpg"])
+        self.assertNotIn("images_pending", self.app_module.chat_sessions[5201])
+        self.assertFalse(os.path.exists(os.path.join(self.temp_dir.name, "tg_5201")))
+        self.assertIn("Listo", context.bot.send_message.await_args.kwargs["text"])
+
+    def test_telegram_images_pending_zip_sends_single_archive(self):
+        self._make_pending_session(5202, count=2)
+        update = self._mock_callback_update("img|zip", chat_id=5202)
+        context = self._mock_context()
+
+        with patch.object(self.app_module, "DOWNLOAD_DIR", str(self.temp_dir.name)):
+            self._run_async(self.app_module.telegram_on_callback(update, context))
+
+        self.assertEqual(context.bot.send_document.await_count, 1)
+        kwargs = context.bot.send_document.await_args.kwargs
+        self.assertTrue(kwargs["filename"].endswith(".zip"))
+        self.assertNotIn("images_pending", self.app_module.chat_sessions[5202])
+
+    def test_telegram_images_pending_cancel_deletes_files(self):
+        self._make_pending_session(5203, count=2)
+        update = self._mock_callback_update("img|cancel", chat_id=5203)
+        context = self._mock_context()
+
+        self._run_async(self.app_module.telegram_on_callback(update, context))
+
+        context.bot.send_document.assert_not_awaited()
+        args, _ = update.callback_query.edit_message_text.call_args
+        self.assertIn("Operacion cancelada", args[0])
+        self.assertNotIn("images_pending", self.app_module.chat_sessions[5203])
+        self.assertFalse(os.path.exists(os.path.join(self.temp_dir.name, "tg_5203")))
+
+    def test_telegram_images_callback_without_pending(self):
+        self.app_module.chat_sessions[5204] = {"url": "https://example.com/x"}
+        update = self._mock_callback_update("img|zip", chat_id=5204)
+        context = self._mock_context()
+
+        self._run_async(self.app_module.telegram_on_callback(update, context))
+
+        args, _ = update.callback_query.edit_message_text.call_args
+        self.assertIn("No hay imagenes pendientes", args[0])
+
+    def test_cleanup_pass_removes_stale_pendings(self):
+        session = self._make_pending_session(5301, count=1)
+        session["images_pending"]["created_at"] = time.time() - 3600
+        fresh = self._make_pending_session(5302, count=1)
+
+        stale_job_workdir = Path(self.temp_dir.name) / "stale_job"
+        stale_job_workdir.mkdir()
+        (stale_job_workdir / "x.jpg").write_bytes(b"x")
+        jobs = self.app_module.jobs
+        jobs["stale"] = {
+            "status": "done",
+            "files": [(str(stale_job_workdir / "x.jpg"), "x.jpg")],
+            "workdir": str(stale_job_workdir),
+            "created_at": time.time() - 3600,
+        }
+        fresh_dir = Path(self.temp_dir.name) / "fresh_job"
+        fresh_dir.mkdir()
+        (fresh_dir / "y.jpg").write_bytes(b"y")
+        jobs["fresh"] = {
+            "status": "done",
+            "files": [(str(fresh_dir / "y.jpg"), "y.jpg")],
+            "workdir": str(fresh_dir),
+            "created_at": time.time(),
+        }
+
+        self.app_module.cleanup_pass()
+
+        self.assertFalse(os.path.exists(stale_job_workdir))
+        self.assertNotIn("stale", jobs)
+        self.assertTrue(fresh_dir.exists())
+        self.assertIn("fresh", jobs)
+        self.assertNotIn("images_pending", self.app_module.chat_sessions[5301])
+        self.assertIn("images_pending", self.app_module.chat_sessions[5302])
 
     # -- normalize_cookies --
 
@@ -952,6 +1303,141 @@ class TelegramIntegrationTests(unittest.TestCase):
         self.app_module.json_save(str(p), {"key": "value"})
         loaded = self.app_module.json_load_dict(str(p))
         self.assertEqual(loaded, {"key": "value"})
+
+    # -- image detection helpers --
+
+    def test_info_is_image_for_direct_link(self):
+        info = {"formats": [{"format_id": "0", "ext": "png", "vcodec": "none", "acodec": "none"}]}
+        self.assertTrue(self.app_module.info_is_image(info))
+
+    def test_info_is_not_image_for_video(self):
+        info = {"formats": [{"format_id": "137", "ext": "mp4", "vcodec": "avc1"}]}
+        self.assertFalse(self.app_module.info_is_image(info))
+
+    def test_info_is_not_image_for_audio_only(self):
+        info = {"formats": [{"format_id": "140", "ext": "m4a", "vcodec": "none", "acodec": "mp4a"}]}
+        self.assertFalse(self.app_module.info_is_image(info))
+
+    def test_info_is_image_for_playlist_of_images(self):
+        info = {
+            "_type": "playlist",
+            "entries": [
+                {"formats": [{"format_id": "0", "ext": "jpg"}]},
+                {"formats": [{"format_id": "1", "ext": "jpg"}]},
+            ],
+        }
+        self.assertTrue(self.app_module.info_is_image(info))
+
+    def test_info_is_not_image_for_mixed_playlist_with_video(self):
+        info = {
+            "_type": "playlist",
+            "entries": [
+                {"formats": []},
+                {"formats": [{"format_id": "137", "ext": "mp4", "vcodec": "avc1"}]},
+            ],
+        }
+        self.assertFalse(self.app_module.info_is_image(info))
+
+    def test_error_is_no_media_patterns(self):
+        self.assertTrue(self.app_module.error_is_no_media("ERROR: No video formats found!"))
+        self.assertTrue(self.app_module.error_is_no_media("There is no video in this post"))
+        self.assertFalse(self.app_module.error_is_no_media("ERROR: Login required"))
+        self.assertFalse(self.app_module.error_is_no_media(""))
+        self.assertFalse(self.app_module.error_is_no_media(None))
+
+    # -- gallery_dl_fetch / zip_image_files --
+
+    @patch("app.subprocess.run")
+    def test_gallery_dl_fetch_returns_loose_files(self, mock_run):
+        def fake_run(cmd, **kwargs):
+            workdir = cmd[cmd.index("--destination") + 1]
+            with open(os.path.join(workdir, "photo.jpg"), "wb") as f:
+                f.write(b"image-data")
+            return Mock(returncode=0, stdout="", stderr="")
+
+        mock_run.side_effect = fake_run
+        downloads_dir = str(Path(self.temp_dir.name) / "downloads")
+
+        with patch.object(self.app_module, "DOWNLOAD_DIR", downloads_dir):
+            files = self.app_module.gallery_dl_fetch("jobx", "https://x/p", 60)
+
+        self.assertEqual(len(files), 1)
+        path, display = files[0]
+        self.assertEqual(display, "photo.jpg")
+        self.assertIn("jobx", path)
+        with open(path, "rb") as f:
+            self.assertEqual(f.read(), b"image-data")
+
+    @patch("app.subprocess.run")
+    def test_gallery_dl_fetch_dedupes_duplicate_names(self, mock_run):
+        def fake_run(cmd, **kwargs):
+            workdir = cmd[cmd.index("--destination") + 1]
+            sub = os.path.join(workdir, "a")
+            os.makedirs(sub)
+            for i, folder in enumerate(["a", "b"]):
+                d = os.path.join(workdir, folder)
+                os.makedirs(d, exist_ok=True)
+                with open(os.path.join(d, "slide.jpg"), "wb") as f:
+                    f.write(f"x{i}".encode())
+            return Mock(returncode=0, stdout="", stderr="")
+
+        mock_run.side_effect = fake_run
+        downloads_dir = str(Path(self.temp_dir.name) / "downloads")
+
+        with patch.object(self.app_module, "DOWNLOAD_DIR", downloads_dir):
+            files = self.app_module.gallery_dl_fetch("dup", "https://x/p", 60)
+
+        names = [display for _p, display in files]
+        self.assertEqual(len(names), 2)
+        self.assertEqual(len(set(n.lower() for n in names)), 2)
+        self.assertIn("slide_2.jpg", names)
+
+    @patch("app.subprocess.run")
+    def test_gallery_dl_fetch_cleans_workdir_on_failure(self, mock_run):
+        mock_run.return_value = Mock(returncode=1, stdout="", stderr="ERROR: Unsupported URL 'xyz'")
+        downloads_dir = str(Path(self.temp_dir.name) / "downloads")
+
+        with patch.object(self.app_module, "DOWNLOAD_DIR", downloads_dir):
+            with self.assertRaises(RuntimeError):
+                self.app_module.gallery_dl_fetch("err", "https://x/y", 60)
+
+        self.assertFalse(os.path.exists(os.path.join(downloads_dir, "err")))
+
+    @patch("app.subprocess.run")
+    def test_gallery_dl_fetch_timeout_cleans_workdir(self, mock_run):
+        mock_run.side_effect = subprocess.TimeoutExpired(cmd=["gallery-dl"], timeout=60)
+        downloads_dir = str(Path(self.temp_dir.name) / "downloads")
+
+        with patch.object(self.app_module, "DOWNLOAD_DIR", downloads_dir):
+            with self.assertRaises(subprocess.TimeoutExpired):
+                self.app_module.gallery_dl_fetch("slow", "https://x/s", 60)
+
+        self.assertFalse(os.path.exists(os.path.join(downloads_dir, "slow")))
+
+    def test_zip_image_files_creates_archive(self):
+        src_a = Path(self.temp_dir.name) / "one.jpg"
+        src_b = Path(self.temp_dir.name) / "two.png"
+        src_a.write_bytes(b"aaa")
+        src_b.write_bytes(b"bbb")
+        zip_path = str(Path(self.temp_dir.name) / "out.zip")
+
+        result = self.app_module.zip_image_files(
+            [(str(src_a), "one.jpg"), (str(src_b), "two.png")], zip_path
+        )
+
+        self.assertEqual(result, zip_path)
+        with zipfile.ZipFile(zip_path) as zf:
+            self.assertEqual(sorted(zf.namelist()), ["one.jpg", "two.png"])
+            self.assertEqual(zf.read("one.jpg"), b"aaa")
+
+    def _make_loose_files(self, count):
+        base = Path(self.temp_dir.name)
+        files = []
+        for i in range(count):
+            p = base / f"img_{i}.jpg"
+            p.write_bytes(f"data-{i}".encode())
+            files.append((str(p), f"img_{i}.jpg"))
+        return files
 
 
 if __name__ == "__main__":

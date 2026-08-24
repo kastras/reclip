@@ -2,31 +2,34 @@
 
 ## Stack
 
-- **Backend:** Python + Flask (single file: `app.py`, ~1230 lines)
+- **Backend:** Python + Flask (single file: `app.py`, ~1350 lines)
 - **Frontend:** Vanilla HTML/CSS/JS en `templates/` (sin frameworks)
-- **Download engine:** yt-dlp + ffmpeg
+- **Download engines:** yt-dlp + ffmpeg (video/audio), gallery-dl (imagenes, ADR-0001)
 - **Bot Telegram:** python-telegram-bot v20+ (asyncio, opcional)
 - **Base de datos:** Archivos JSON planos en `data/` (acl.json, web_codes.json, download_log.json)
 - **Testing:** unittest con mocks de asyncio/subprocess (pytest tambien funciona)
-- **Docker:** Python 3.12-slim, gunicorn, yt-dlp se actualiza al arrancar
+- **Docker:** Python 3.12-slim, gunicorn, yt-dlp y gallery-dl se actualizan al arrancar
 
 ## Dependencias
 
-Solo 3: `flask`, `yt-dlp`, `python-telegram-bot`
+Solo 4: `flask`, `yt-dlp`, `gallery-dl`, `python-telegram-bot`
 
 ## Estructura de archivos
 
 ```
 app.py                    # Backend completo (Flask + Telegram bot)
+docs/
+  CONTEXT.md              # Dominio, glosario y flujos
+  adr/                    # Decisiones de arquitectura (gallery-dl, ZIP carruseles, deteccion)
 templates/
-  index.html              # UI web principal (721 lines, vanilla)
+  index.html              # UI web principal (~730 lines, vanilla)
   admin.html              # Panel de administracion (407 lines)
   access.html             # Pagina de codigo de acceso web
 static/
   favicon.svg
 tests/
   test_app.py             # Tests de app (163 lines)
-  test_integration.py     # Tests de integracion (958 lines)
+  test_integration.py     # Tests de integracion (>1100 lines)
 data/
   cookies_admin.txt       # Cookies gestionadas desde el admin
 downloads/                # Descargas (gitignored)
@@ -77,9 +80,17 @@ Handlers: `start`, `help`, `cookies`, `cancel`, `on_message`, `on_callback`
 
 Flujo:
 1. Usuario envia /start -> genera codigo de 6 chars -> admin lo aprueba en `/admin`
-2. Usuario envia URL -> bot responde con menu de formatos (callback `dl|best`, `dl|audio`, `dl|f|<format_id>`)
-3. Bot descarga con `download_sync` y envia archivo
+2. Usuario envia URL -> bot responde con menu de formatos (callback `dl|best`, `dl|audio`, `dl|f|<format_id>`); si el enlace es de imagenes muestra boton unico "Imagen" (`dl|image`)
+3. Bot descarga con `download_sync` (o `gallery_dl_fetch` si imagen) y envia archivo; carrusel 2-9 -> menu `img|loose`/`img|zip`/`img|cancel`
 4. Si archivo > 49 MB: genera token de descarga, envia enlace de un solo uso
+
+### Soporte de imagenes (ADR-0001/0002/0003/0004)
+
+- Deteccion: `error_is_no_media()` (errores tipo "No video formats") y `info_is_image()` (sin formatos con vcodec/acodec reales). `/api/info` devuelve `is_image: true`.
+- Motor: `gallery_dl_fetch()` ejecuta gallery-dl y devuelve lista suelta `(path, nombre_original)`; `zip_image_files()` empaqueta bajo demanda
+- Entrega: 1 -> original; 2-9 -> pregunta sueltas/ZIP (botones web "Images"/"ZIP", rutas `/api/file/<id>/<index>` y `/api/zip/<id>`; en bot callbacks `img|loose`/`img|zip`/`img|cancel` con `images_pending` en chat_sessions); >= 10 (`IMAGE_ZIP_MIN_FILES`) -> ZIP automatico
+- Limpieza: `cleanup_pass()` barre pendientes/jobs multi sin resolver tras 30 min (`PENDING_TTL_SECONDS`)
+- Cookies compartidas con yt-dlp (misma resolucion: browser > admin cookies.txt > COOKIES_FILE)
 
 ### Descargas grandes (>49 MB Telegram)
 

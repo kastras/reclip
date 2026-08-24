@@ -5,6 +5,8 @@ import time
 import uuid
 import glob
 import json
+import shutil
+import zipfile
 import asyncio
 import logging
 import re
@@ -376,26 +378,47 @@ def record_login_attempt(ip: str, success: bool) -> None:
 # Periodic cleanup of pending codes
 # ---------------------------------------------------------------------------
 
+def cleanup_pass() -> None:
+    now = time.time()
+    expired_codes = [
+        code for code, entry in list(pending_codes.items())
+        if now - entry.get("created_at", 0) > 1800
+    ]
+    for code in expired_codes:
+        pending_codes.pop(code, None)
+    if expired_codes:
+        app.logger.info("Cleaned %d expired pending codes", len(expired_codes))
+
+    expired_setup = [
+        cid for cid, ts in list(pending_cookies_setup.items())
+        if now - ts > 1800
+    ]
+    for cid in expired_setup:
+        del pending_cookies_setup[cid]
+
+    for cid, s in list(chat_sessions.items()):
+        p = s.get("images_pending")
+        if p and now - p.get("created_at", now) > PENDING_TTL_SECONDS:
+            discard_images_pending(s)
+
+    for jid, j in list(jobs.items()):
+        if (
+            j.get("status") == "done"
+            and j.get("files")
+            and now - j.get("created_at", now) > PENDING_TTL_SECONDS
+        ):
+            shutil.rmtree(j.get("workdir", ""), ignore_errors=True)
+            jobs.pop(jid, None)
+
+
 def start_cleanup_thread() -> None:
     def cleanup():
         while True:
             time.sleep(300)
-            now = time.time()
-            expired_codes = [
-                code for code, entry in list(pending_codes.items())
-                if now - entry.get("created_at", 0) > 1800
-            ]
-            for code in expired_codes:
-                pending_codes.pop(code, None)
-            if expired_codes:
-                app.logger.info("Cleaned %d expired pending codes", len(expired_codes))
-
-            expired_setup = [
-                cid for cid, ts in list(pending_cookies_setup.items())
-                if now - ts > 1800
-            ]
-            for cid in expired_setup:
-                del pending_cookies_setup[cid]
+            try:
+                cleanup_pass()
+            except Exception:
+                app.logger.exception("Cleanup pass failed")
 
     thread = threading.Thread(target=cleanup, name="cleanup", daemon=True)
     thread.start()
@@ -419,6 +442,113 @@ def sanitize_filename(title, fallback_name):
             ext = os.path.splitext(fallback_name)[1]
             return f"{safe_title}{ext}"
     return fallback_name
+
+
+MEDIA_FORMAT_EXTS = {
+    "mp4", "webm", "mkv", "mov", "avi", "m4v", "flv", "ts", "3gp",
+    "mp3", "m4a", "aac", "wav", "opus", "flac", "ogg",
+}
+
+
+def _entry_has_media(entry):
+    if not isinstance(entry, dict):
+        return False
+    for f in entry.get("formats") or []:
+        ext = str(f.get("ext") or "").lower()
+        if f.get("vcodec") not in (None, "none"):
+            return True
+        if f.get("acodec") not in (None, "none"):
+            return True
+        if ext in MEDIA_FORMAT_EXTS:
+            return True
+    return False
+
+
+def info_is_image(info):
+    if not isinstance(info, dict):
+        return False
+    if info.get("_type") == "playlist":
+        entries = [e for e in (info.get("entries") or []) if e]
+        return bool(entries) and all(not _entry_has_media(e) for e in entries)
+    return not _entry_has_media(info)
+
+
+def error_is_no_media(message):
+    m = (message or "").lower()
+    return (
+        "no video formats" in m
+        or "there is no video in this post" in m
+        or "no media formats" in m
+    )
+
+
+def gallery_dl_cookies_args() -> list[str]:
+    args = []
+    if COOKIES_FROM_BROWSER:
+        args += ["--cookies-from-browser", COOKIES_FROM_BROWSER]
+    elif os.path.isfile(ADMIN_COOKIES_PATH):
+        args += ["--cookies", ADMIN_COOKIES_PATH]
+    elif os.path.isfile(COOKIES_FILE):
+        args += ["--cookies", COOKIES_FILE]
+    return args
+
+
+IMAGE_ZIP_MIN_FILES = 10
+PENDING_TTL_SECONDS = 1800
+
+
+def image_workdir(prefix):
+    return os.path.join(DOWNLOAD_DIR, prefix)
+
+
+def gallery_dl_fetch(prefix, url, timeout=300):
+    workdir = image_workdir(prefix)
+    os.makedirs(workdir, exist_ok=True)
+    try:
+        cmd = ["gallery-dl", "--destination", workdir, "--no-part"]
+        cmd += gallery_dl_cookies_args()
+        cmd.append(url)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+
+        produced = []
+        for root, _dirs, names in os.walk(workdir):
+            for name in names:
+                path = os.path.join(root, name)
+                if name.endswith(".part") or name.startswith("."):
+                    continue
+                try:
+                    if os.path.getsize(path) > 0:
+                        produced.append(path)
+                except OSError:
+                    pass
+
+        if not produced:
+            error_line = result.stderr.strip().split("\n")[-1] if result.stderr else "Unknown error"
+            raise RuntimeError(error_line)
+
+        files = []
+        seen = set()
+        for path in produced:
+            base = os.path.basename(path)
+            stem, ext = os.path.splitext(base)
+            display = base
+            n = 2
+            while display.lower() in seen:
+                display = f"{stem}_{n}{ext}"
+                n += 1
+            seen.add(display.lower())
+            files.append((path, display))
+        return files
+    except BaseException:
+        shutil.rmtree(workdir, ignore_errors=True)
+        raise
+
+
+def zip_image_files(files, zip_path):
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for path, name in files:
+            zf.write(path, arcname=name)
+    return zip_path
 
 
 def download_sync(prefix, url, format_choice, format_id=None, title="", timeout=300):
@@ -465,6 +595,9 @@ def download_sync(prefix, url, format_choice, format_id=None, title="", timeout=
 def run_download(job_id, url, format_choice, format_id):
     job = jobs[job_id]
     try:
+        if format_choice == "image":
+            _run_image_job(job_id, url, job)
+            return
         chosen, filename = download_sync(
             prefix=job_id,
             url=url,
@@ -490,6 +623,42 @@ def run_download(job_id, url, format_choice, format_id):
     except Exception as e:
         job["status"] = "error"
         job["error"] = str(e)
+
+
+def _run_image_job(job_id, url, job):
+    title = job.get("title", "")
+    files = gallery_dl_fetch(job_id, url, 300)
+    log_filename = files[0][1]
+    if len(files) >= IMAGE_ZIP_MIN_FILES:
+        zip_path = zip_image_files(files, os.path.join(DOWNLOAD_DIR, f"{job_id}.zip"))
+        shutil.rmtree(image_workdir(job_id), ignore_errors=True)
+        job["status"] = "done"
+        job["file"] = zip_path
+        job["filename"] = sanitize_filename(title, os.path.basename(zip_path))
+        log_filename = job["filename"]
+    elif len(files) == 1:
+        src, fname = files[0]
+        target = os.path.join(DOWNLOAD_DIR, f"{job_id}{os.path.splitext(src)[1]}")
+        shutil.move(src, target)
+        shutil.rmtree(image_workdir(job_id), ignore_errors=True)
+        job["status"] = "done"
+        job["file"] = target
+        job["filename"] = sanitize_filename(title, os.path.basename(target))
+        log_filename = job["filename"]
+    else:
+        job["status"] = "done"
+        job["files"] = files
+        job["files_count"] = len(files)
+        job["workdir"] = image_workdir(job_id)
+        job["created_at"] = time.time()
+    log_download_event(
+        source="web",
+        url=url,
+        title=title,
+        format_choice="image",
+        actor=job.get("actor", "web"),
+        filename=log_filename,
+    )
 
 
 @app.route("/")
@@ -612,8 +781,8 @@ def admin():
                             with open(ADMIN_COOKIES_PATH, "w", encoding="utf-8") as f:
                                 f.write(normalized)
                             message = "Cookies guardadas correctamente."
-                        except OSError:
-                            error = "Error al guardar el archivo de cookies."
+                        except OSError as e:
+                            error = f"Error al guardar el archivo de cookies: {e}"
                 else:
                     error = "No hay contenido de cookies para guardar."
 
@@ -657,21 +826,31 @@ def get_info():
 
     try:
         info = fetch_video_info(url, timeout=60)
-        formats = build_quality_options(info)
-
-        return jsonify({
-            "title": info.get("title", ""),
-            "thumbnail": info.get("thumbnail", ""),
-            "duration": info.get("duration"),
-            "uploader": info.get("uploader", ""),
-            "formats": formats,
-        })
     except subprocess.TimeoutExpired:
         return jsonify({"error": "Timed out fetching video info"}), 400
     except ValueError as e:
+        if error_is_no_media(str(e)):
+            return jsonify({
+                "title": "",
+                "thumbnail": "",
+                "duration": None,
+                "uploader": "",
+                "formats": [],
+                "is_image": True,
+            })
         return jsonify({"error": str(e)}), 400
     except Exception as e:
         return jsonify({"error": str(e)}), 400
+
+    formats = build_quality_options(info)
+    return jsonify({
+        "title": info.get("title", ""),
+        "thumbnail": info.get("thumbnail", ""),
+        "duration": info.get("duration"),
+        "uploader": info.get("uploader", ""),
+        "formats": formats,
+        "is_image": info_is_image(info),
+    })
 
 
 @app.route("/api/playlist", methods=["POST"])
@@ -698,15 +877,17 @@ def get_playlist_info():
 
 
 
-def build_telegram_menu(formats):
-    buttons = [[
-        InlineKeyboardButton("Video (mejor)", callback_data="dl|best"),
-        InlineKeyboardButton("Audio MP3", callback_data="dl|audio"),
-    ]]
-
-    shown_formats = formats[:8]
-    for f in shown_formats:
-        buttons.append([InlineKeyboardButton(f["label"], callback_data=f"dl|f|{f['id']}")])
+def build_telegram_menu(formats, is_image=False):
+    if is_image:
+        buttons = [[InlineKeyboardButton("Imagen", callback_data="dl|image")]]
+    else:
+        buttons = [[
+            InlineKeyboardButton("Video (mejor)", callback_data="dl|best"),
+            InlineKeyboardButton("Audio MP3", callback_data="dl|audio"),
+        ]]
+        shown_formats = formats[:8]
+        for f in shown_formats:
+            buttons.append([InlineKeyboardButton(f["label"], callback_data=f"dl|f|{f['id']}")])
 
     buttons.append([InlineKeyboardButton("Cancelar", callback_data="dl|cancel")])
     return InlineKeyboardMarkup(buttons)
@@ -820,8 +1001,8 @@ async def telegram_on_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             await update.message.reply_text(
                 "Cookies guardadas correctamente. Ya puedes descargar desde sitios que requieren autenticacion."
             )
-        except OSError:
-            await update.message.reply_text("Error al guardar las cookies. Intenta de nuevo o usa el panel web.")
+        except OSError as e:
+            await update.message.reply_text(f"Error al guardar las cookies: {e}. Intenta de nuevo o usa el panel web.")
         finally:
             del pending_cookies_setup[chat_id]
         return
@@ -832,32 +1013,87 @@ async def telegram_on_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     loading_msg = await update.message.reply_text("Analizando enlace...")
+    info = None
     try:
         info = await asyncio.to_thread(fetch_video_info, url, 60)
     except subprocess.TimeoutExpired:
         await loading_msg.edit_text("Se agoto el tiempo al leer info del video.")
         return
     except Exception as e:
-        await loading_msg.edit_text(f"No pude leer ese enlace: {e}")
-        return
+        if not error_is_no_media(str(e)):
+            await loading_msg.edit_text(f"No pude leer ese enlace: {e}")
+            return
 
-    formats = build_quality_options(info)
+    is_image = info is None or info_is_image(info)
+    formats = [] if is_image else build_quality_options(info)
     chat_id = update.effective_chat.id
+    discard_images_pending(chat_sessions.get(chat_id))
     chat_sessions[chat_id] = {
         "url": url,
-        "title": (info.get("title") or "").strip(),
+        "title": (info.get("title") or "").strip() if info else "",
         "formats": formats,
+        "is_image": is_image,
     }
 
-    title = info.get("title", "Sin titulo")
-    uploader = info.get("uploader") or "desconocido"
-    duration = format_duration(info.get("duration"))
-    text = f"{title}\nCanal: {uploader}\nDuracion: {duration}\n\nElige formato:" 
-    await loading_msg.edit_text(text, reply_markup=build_telegram_menu(formats))
+    if is_image:
+        title = (info.get("title") or "Imagen") if info else "Imagen"
+        text = f"{title}\n\nElige formato:"
+    else:
+        title = info.get("title", "Sin titulo")
+        uploader = info.get("uploader") or "desconocido"
+        duration = format_duration(info.get("duration"))
+        text = f"{title}\nCanal: {uploader}\nDuracion: {duration}\n\nElige formato:"
+    await loading_msg.edit_text(text, reply_markup=build_telegram_menu(formats, is_image))
+
+
+async def telegram_send_file(chat_id, bot, path, filename):
+    size_mb = os.path.getsize(path) / (1024 * 1024)
+    if size_mb > 49:
+        base_url = os.environ.get("RECLIP_BASE_URL", "").rstrip("/")
+        if not base_url:
+            raise RuntimeError(
+                f"El archivo pesa {size_mb:.0f} MB y supera el limite de 49 MB de Telegram, "
+                "y RECLIP_BASE_URL no esta configurado para generar un enlace de descarga."
+            )
+        token = uuid.uuid4().hex
+        download_tokens[token] = {"path": path, "filename": filename}
+        link = f"{base_url}/dl/{token}"
+        await bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"El archivo pesa {size_mb:.0f} MB y supera el limite de Telegram.\n\n"
+                f"Descargalo desde este enlace (expira tras la primera descarga):\n{link}"
+            ),
+        )
+        return
+    with open(path, "rb") as f:
+        await bot.send_document(chat_id=chat_id, document=f, filename=filename)
+
+
+def discard_images_pending(session):
+    pending = session.pop("images_pending", None) if session else None
+    if pending and pending.get("workdir"):
+        shutil.rmtree(pending["workdir"], ignore_errors=True)
+
+
+def build_images_pending_menu(pending):
+    count = len(pending["files"])
+    markup = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("Sueltas al chat", callback_data="img|loose"),
+            InlineKeyboardButton("ZIP", callback_data="img|zip"),
+        ],
+        [InlineKeyboardButton("Cancelar", callback_data="img|cancel")],
+    ])
+    return f"Encontre {count} imagenes. Como las quieres?", markup
 
 
 async def telegram_send_download(chat_id, bot, url, title, format_choice, format_id=None):
     prefix = f"tg_{uuid.uuid4().hex[:10]}"
+    if format_choice == "image":
+        await telegram_send_images(chat_id, bot, url, title, prefix)
+        return
+
     path = None
     try:
         path, filename = await asyncio.to_thread(
@@ -869,28 +1105,7 @@ async def telegram_send_download(chat_id, bot, url, title, format_choice, format
             title,
             300,
         )
-        size_mb = os.path.getsize(path) / (1024 * 1024)
-        if size_mb > 49:
-            base_url = os.environ.get("RECLIP_BASE_URL", "").rstrip("/")
-            if not base_url:
-                raise RuntimeError(
-                    f"El archivo pesa {size_mb:.0f} MB y supera el limite de 49 MB de Telegram, "
-                    "y RECLIP_BASE_URL no esta configurado para generar un enlace de descarga."
-                )
-            token = uuid.uuid4().hex
-            download_tokens[token] = {"path": path, "filename": filename}
-            link = f"{base_url}/dl/{token}"
-            await bot.send_message(
-                chat_id=chat_id,
-                text=(
-                    f"El archivo pesa {size_mb:.0f} MB y supera el limite de Telegram.\n\n"
-                    f"Descargalo desde este enlace (expira tras la primera descarga):\n{link}"
-                ),
-            )
-
-            return
-        with open(path, "rb") as f:
-            await bot.send_document(chat_id=chat_id, document=f, filename=filename)
+        await telegram_send_file(chat_id, bot, path, filename)
     finally:
         if path and os.path.exists(path) and not any(
             t["path"] == path for t in download_tokens.values()
@@ -899,6 +1114,94 @@ async def telegram_send_download(chat_id, bot, url, title, format_choice, format
                 os.remove(path)
             except OSError:
                 pass
+
+
+async def telegram_send_images(chat_id, bot, url, title, prefix):
+    files = await asyncio.to_thread(gallery_dl_fetch, prefix, url, 300)
+    workdir = image_workdir(prefix)
+
+    if len(files) >= IMAGE_ZIP_MIN_FILES:
+        zip_path = zip_image_files(files, os.path.join(DOWNLOAD_DIR, f"{prefix}.zip"))
+        shutil.rmtree(workdir, ignore_errors=True)
+        filename = sanitize_filename(title, os.path.basename(zip_path))
+        try:
+            await telegram_send_file(chat_id, bot, zip_path, filename)
+        finally:
+            if os.path.exists(zip_path) and not any(
+                t["path"] == zip_path for t in download_tokens.values()
+            ):
+                try:
+                    os.remove(zip_path)
+                except OSError:
+                    pass
+        return
+
+    if len(files) == 1:
+        path, fname = files[0]
+        fname = sanitize_filename(title, fname)
+        try:
+            await telegram_send_file(chat_id, bot, path, fname)
+        finally:
+            shutil.rmtree(workdir, ignore_errors=True)
+        return
+
+    chat_sessions[chat_id]["images_pending"] = {
+        "prefix": prefix,
+        "workdir": workdir,
+        "files": files,
+        "url": url,
+        "title": title,
+        "created_at": time.time(),
+    }
+
+
+async def handle_images_callback(query, context, data, chat_id, session):
+    pending = session.get("images_pending")
+    if not pending:
+        await query.edit_message_text("No hay imagenes pendientes.")
+        return
+
+    if data == "img|cancel":
+        await query.edit_message_text("Operacion cancelada.")
+        return
+
+    files = pending["files"]
+    actor = query.from_user.username or query.from_user.first_name or str(chat_id)
+
+    if data == "img|zip":
+        await query.edit_message_text("Comprimiendo imagenes...")
+        zip_path = await asyncio.to_thread(
+            zip_image_files,
+            files,
+            os.path.join(DOWNLOAD_DIR, f"{pending['prefix']}.zip"),
+        )
+        filename = sanitize_filename(pending.get("title", ""), os.path.basename(zip_path))
+        await telegram_send_file(chat_id, context.bot, zip_path, filename)
+        log_download_event(
+            source="telegram",
+            url=pending["url"],
+            title=pending.get("title", ""),
+            format_choice="image",
+            actor=actor,
+            filename=filename,
+        )
+        acl_increment_downloads(chat_id)
+        await context.bot.send_message(chat_id=chat_id, text="Listo. Si quieres otro, enviame otro enlace.")
+        return
+
+    await query.edit_message_text(f"Enviando {len(files)} imagenes...")
+    for path, fname in files:
+        await telegram_send_file(chat_id, context.bot, path, fname)
+    log_download_event(
+        source="telegram",
+        url=pending["url"],
+        title=pending.get("title", ""),
+        format_choice="image",
+        actor=actor,
+        filename=files[0][1],
+    )
+    acl_increment_downloads(chat_id)
+    await context.bot.send_message(chat_id=chat_id, text="Listo. Si quieres otro, enviame otro enlace.")
 
 
 async def telegram_on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -918,8 +1221,20 @@ async def telegram_on_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     if data == "dl|cancel":
+        discard_images_pending(session)
         chat_sessions.pop(chat_id, None)
         await query.edit_message_text("Operacion cancelada.")
+        return
+
+    if data.startswith("img|"):
+        try:
+            await handle_images_callback(query, context, data, chat_id, session)
+        except subprocess.TimeoutExpired:
+            await context.bot.send_message(chat_id=chat_id, text="Tiempo agotado al preparar los archivos.")
+        except Exception as e:
+            await context.bot.send_message(chat_id=chat_id, text=f"Error al enviar las imagenes: {e}")
+        finally:
+            discard_images_pending(session)
         return
 
     if not data.startswith("dl|"):
@@ -931,6 +1246,8 @@ async def telegram_on_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         format_choice = "audio"
     elif data == "dl|best":
         format_choice = "video"
+    elif data == "dl|image":
+        format_choice = "image"
     elif data.startswith("dl|f|"):
         format_choice = "video"
         format_id = data.split("|", 2)[2]
@@ -948,6 +1265,11 @@ async def telegram_on_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             format_choice=format_choice,
             format_id=format_id,
         )
+        pending = chat_sessions.get(chat_id, {}).get("images_pending")
+        if pending:
+            text, markup = build_images_pending_menu(pending)
+            await query.edit_message_text(text, reply_markup=markup)
+            return
         actor = query.from_user.username or query.from_user.first_name or str(chat_id)
         log_download_event(
             source="telegram",
@@ -1191,6 +1513,7 @@ def check_status(job_id):
         "status": job["status"],
         "error": job.get("error"),
         "filename": job.get("filename"),
+        "files_count": job.get("files_count"),
     })
 
 
@@ -1223,6 +1546,82 @@ def download_file(job_id):
     mime = mimetypes.guess_type(filename)[0] or "application/octet-stream"
     headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
     return Response(stream_with_context(stream_and_delete()), headers=headers, mimetype=mime)
+
+
+def _consume_job_file(job_id, job, index):
+    served = job.setdefault("served", set())
+    served.add(index)
+    try:
+        os.remove(job["files"][index][0])
+    except OSError:
+        pass
+    if len(served) >= len(job["files"]):
+        shutil.rmtree(job.get("workdir", ""), ignore_errors=True)
+        jobs.pop(job_id, None)
+
+
+@app.route("/api/file/<job_id>/<int:index>")
+def download_file_index(job_id, index):
+    job = jobs.get(job_id)
+    files = job.get("files") if job and job.get("status") == "done" else None
+    if not files or index >= len(files) or index in job.get("served", set()):
+        return jsonify({"error": "File not ready"}), 404
+
+    path, filename = files[index]
+    if not os.path.exists(path):
+        _consume_job_file(job_id, job, index)
+        return jsonify({"error": "File not ready"}), 404
+
+    def stream_and_delete():
+        try:
+            with open(path, "rb") as f:
+                yield from f
+        finally:
+            _consume_job_file(job_id, job, index)
+
+    from flask import Response, stream_with_context
+    import mimetypes
+    mime = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+    headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+    return Response(stream_with_context(stream_and_delete()), headers=headers, mimetype=mime)
+
+
+@app.route("/api/zip/<job_id>")
+def download_job_zip(job_id):
+    job = jobs.get(job_id)
+    files = job.get("files") if job and job.get("status") == "done" else None
+    served = job.get("served", set()) if job else set()
+    remaining = [f for i, f in enumerate(files or []) if i not in served]
+    if not remaining:
+        return jsonify({"error": "File not ready"}), 404
+
+    zip_path = os.path.join(DOWNLOAD_DIR, f"{job_id}.zip")
+    try:
+        zip_image_files(remaining, zip_path)
+    except OSError:
+        return jsonify({"error": "File not ready"}), 404
+
+    filename = sanitize_filename(job.get("title", ""), os.path.basename(zip_path))
+    workdir = job.get("workdir", "")
+
+    def stream_and_delete():
+        try:
+            with open(zip_path, "rb") as f:
+                yield from f
+        finally:
+            try:
+                os.remove(zip_path)
+            except OSError:
+                pass
+            shutil.rmtree(workdir, ignore_errors=True)
+            jobs.pop(job_id, None)
+
+    from flask import Response, stream_with_context
+    headers = {
+        "Content-Disposition": f'attachment; filename="{filename}"',
+        "Content-Type": "application/zip",
+    }
+    return Response(stream_with_context(stream_and_delete()), headers=headers)
 
 
 start_cleanup_thread()

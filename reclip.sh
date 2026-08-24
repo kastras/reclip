@@ -35,7 +35,7 @@ if [ ! -d "venv" ]; then
     echo "Setting up virtual environment..."
     python3 -m venv venv
     source venv/bin/activate
-    pip install -q flask yt-dlp
+    pip install -q flask yt-dlp gallery-dl
 else
     source venv/bin/activate
 fi
@@ -43,8 +43,9 @@ fi
 # Keep yt-dlp fresh — sites (Instagram, Facebook, etc.) break its extractors
 # frequently, and the usual fix is simply updating yt-dlp. Skip with RECLIP_NO_UPDATE=1.
 if [ -z "$RECLIP_NO_UPDATE" ]; then
-    echo "Updating yt-dlp..."
+    echo "Updating yt-dlp and gallery-dl..."
     pip install -q -U yt-dlp || echo "  (couldn't update yt-dlp — continuing with the installed version)"
+    pip install -q -U gallery-dl || echo "  (couldn't update gallery-dl — continuing with the installed version)"
 fi
 
 PORT="${PORT:-8899}"

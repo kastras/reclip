@@ -512,6 +512,7 @@
               uploader: data.uploader || '',
               formats: data.formats || [],
               selectedFormatId: data.formats?.[0]?.id || null,
+              isImage: !!data.is_image,
             };
           }
         } catch (err) {
@@ -574,7 +575,11 @@
       const isAudio = currentFormat === 'audio';
 
       let thumbHtml;
-      if (isAudio) {
+      if (c.isImage) {
+        thumbHtml = c.thumbnail
+          ? `<img src="${c.thumbnail}" alt="">`
+          : `<div class="no-thumb"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="20" height="20" rx="2"/><circle cx="8" cy="8" r="1.5"/><path d="m21 15-5-5L5 21"/></svg></div>`;
+      } else if (isAudio) {
         thumbHtml = `<div class="no-thumb" style="color:var(--accent)"><svg viewBox="0 0 24 24" fill="currentColor" stroke="none"><polygon points="5 3 19 12 5 21 5 3"/></svg></div>`;
       } else if (c.thumbnail) {
         thumbHtml = `<img src="${c.thumbnail}" alt="">`;
@@ -583,7 +588,7 @@
       }
 
       let qualityChips = '';
-      if (!isAudio && c.formats && c.formats.length > 1) {
+      if (!isAudio && !c.isImage && c.formats && c.formats.length > 1) {
         qualityChips = c.formats.map(f =>
           `<button class="q-chip${f.id === c.selectedFormatId ? ' active' : ''}" onclick="pickFormat(${idx}, '${f.id}')">${f.label}</button>`
         ).join('');
@@ -595,8 +600,14 @@
       } else if (c.status === 'downloading') {
         actionHtml = `<span class="card-status downloading"><span class="spin"></span> Downloading...</span>`;
       } else if (c.status === 'done') {
-        actionHtml = `<button class="card-dl-btn done" onclick="saveCard(${idx})">Save</button>
-          <span class="card-status done">${esc(c.filename || '')}</span>`;
+        const n = c.filesCount || 1;
+        if (n > 1 && n < 10) {
+          actionHtml = `<button class="card-dl-btn" onclick="saveLoose(${idx})">Images (${n})</button>
+            <button class="card-dl-btn" onclick="saveZip(${idx})">ZIP</button>`;
+        } else {
+          actionHtml = `<button class="card-dl-btn done" onclick="saveCard(${idx})">Save</button>
+            <span class="card-status done">${esc(c.filename || '')}</span>`;
+        }
       } else if (c.status === 'error') {
         actionHtml = `<button class="card-dl-btn" onclick="dlCard(${idx})">Retry</button>
           <span class="card-status error">${esc(friendlyError(c.error || 'Download failed'))}</span>`;
@@ -640,7 +651,7 @@
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             url: c.url,
-            format: currentFormat,
+            format: c.isImage ? 'image' : currentFormat,
             format_id: c.selectedFormatId,
             title: c.title || '',
           }),
@@ -678,8 +689,9 @@
             clearInterval(iv);
             c.status = 'done';
             c.filename = data.filename;
+            c.filesCount = data.files_count || 1;
             renderCard(idx);
-            saveCard(idx);
+            if (c.filesCount <= 1 || c.filesCount >= 10) saveCard(idx);
           } else if (data.status === 'error') {
             clearInterval(iv);
             c.status = 'error';
@@ -701,6 +713,27 @@
       const a = document.createElement('a');
       a.href = `/api/file/${c.jobId}`;
       a.download = c.filename || '';
+      a.click();
+    }
+
+    async function saveLoose(idx) {
+      const c = cardData[idx];
+      if (!c.jobId) return;
+      for (let i = 0; i < (c.filesCount || 1); i++) {
+        const a = document.createElement('a');
+        a.href = `/api/file/${c.jobId}/${i}`;
+        a.download = '';
+        a.click();
+        await new Promise(r => setTimeout(r, 300));
+      }
+    }
+
+    function saveZip(idx) {
+      const c = cardData[idx];
+      if (!c.jobId) return;
+      const a = document.createElement('a');
+      a.href = `/api/zip/${c.jobId}`;
+      a.download = '';
       a.click();
     }
 

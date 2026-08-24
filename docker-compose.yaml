@@ -26,11 +26,7 @@ services:
       - "traefik.http.routers.reclip.tls.certresolver=${TRAEFIK_CERTRESOLVER:-letsencrypt}"
       - "traefik.http.services.reclip.loadbalancer.server.port=8899"
     volumes:
-      - downloads:/app/downloads
-      - data:/app/data
+      - ./downloads:/app/downloads
+      - ./data:/app/data
     restart: unless-stopped
-
-volumes:
-  downloads:
-  data:
 
